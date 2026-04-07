@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -25,6 +26,12 @@ ENV_PATH = BASE_DIR / ".env"
 HISTORY_PATH = BASE_DIR / "sent_news_history.json"
 
 load_dotenv(dotenv_path=ENV_PATH, override=True)
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def now_kst() -> datetime:
+    return datetime.now(KST)
 
 
 def safe_print(*args: object, sep: str = " ", end: str = "\n") -> None:
@@ -70,7 +77,6 @@ STOPWORDS = {
     "발표", "공시", "시장", "업계", "뉴스", "로봇", "robot", "news", "the", "and"
 }
 
-# ── 경쟁사 업체명 키워드 (이 중 하나라도 있어야 통과) ──────────
 COMPANY_KEYWORDS: list[str] = [
     "유일로보틱스",
     "나우로보틱스",
@@ -83,7 +89,6 @@ COMPANY_KEYWORDS: list[str] = [
     "TOPSTAR",
 ]
 
-# 검색 쿼리 목록 (각 업체별로 정확하게 검색)
 COMPETITOR_QUERIES: list[str] = [
     "유일로보틱스",
     "나우로보틱스",
@@ -163,7 +168,6 @@ def token_similarity(title_a: str, title_b: str) -> float:
 
 
 def extract_matched_company(text: str) -> str:
-    """텍스트에서 지정된 경쟁사 키워드를 찾아 반환"""
     text_lower = text.lower()
     for kw in COMPANY_KEYWORDS:
         if kw.lower() in text_lower:
@@ -172,7 +176,6 @@ def extract_matched_company(text: str) -> str:
 
 
 def is_valid_competitor_article(article: dict[str, str]) -> bool:
-    """경쟁사 기사인지 엄격하게 검증 - 지정 업체명이 반드시 포함되어야 함"""
     title = article.get("title", "")
     desc = article.get("description", "")
     combined = f"{title} {desc}"
@@ -195,7 +198,7 @@ def parse_pubdate(pub_date: str) -> datetime | None:
         dt = parsedate_to_datetime(pub_date)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone()
+        return dt.astimezone(KST)
     except Exception:
         return None
 
@@ -204,7 +207,7 @@ def get_article_age_days(article: dict[str, str]) -> int | None:
     dt = parse_pubdate(article.get("pubDate", ""))
     if dt is None:
         return None
-    now = datetime.now(dt.tzinfo)
+    now = now_kst()
     delta = now - dt
     return max(delta.days, 0)
 
@@ -315,7 +318,7 @@ def load_history() -> list[dict[str, str]]:
 def save_history(today_records: list[dict[str, str]]) -> None:
     history = load_history()
     history.extend(today_records)
-    cutoff = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+    cutoff = (now_kst() - timedelta(days=14)).strftime("%Y-%m-%d")
     trimmed = [x for x in history if x.get("date", "") >= cutoff]
     try:
         with open(HISTORY_PATH, "w", encoding="utf-8") as f:
@@ -347,7 +350,7 @@ def is_recent_duplicate(article: dict[str, str], recent_history: list[dict[str, 
 
 def get_recent_history(days: int = 3) -> list[dict[str, str]]:
     history = load_history()
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (now_kst() - timedelta(days=days)).strftime("%Y-%m-%d")
     return [x for x in history if x.get("date", "") >= cutoff]
 
 
@@ -366,7 +369,6 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
     collected: dict[str, list[dict[str, str]]] = {}
     stats: dict[str, dict[str, int]] = {}
 
-    # ── 플라스틱/사출 수집 ──────────────────────────────
     raw_plastic: list[dict[str, str]] = []
     for q in plastic_queries:
         try:
@@ -392,7 +394,6 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
     collected["플라스틱_사출"] = final_plastic[:category_limits["플라스틱_사출"]]
     stats["플라스틱_사출"] = {"raw": len(raw_plastic), "grouped": len(grouped_plastic), "fresh": len(fresh_plastic), "final": len(collected["플라스틱_사출"])}
 
-    # ── 경쟁사 수집 (엄격한 업체명 필터 적용) ──────────
     raw_competitor: list[dict[str, str]] = []
     for q in COMPETITOR_QUERIES:
         try:
@@ -400,7 +401,6 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
         except Exception as e:
             safe_print(f"[경고] '{q}' 검색 실패: {e}")
 
-    # 1차: 중복 URL/제목 제거
     deduped_competitor: list[dict[str, str]] = []
     seen_keys2: set[str] = set()
     for a in raw_competitor:
@@ -409,7 +409,6 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
             seen_keys2.add(key)
             deduped_competitor.append(a)
 
-    # 2차: 반드시 지정 업체명이 포함된 기사만 통과 (핵심 필터)
     company_filtered = [a for a in deduped_competitor if is_valid_competitor_article(a)]
     blocked_count = len(deduped_competitor) - len(company_filtered)
     if blocked_count > 0:
@@ -452,7 +451,7 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
                 f"  링크: {article['link']}"
             )
     news_text = "\n".join(news_text_parts)
-    today = datetime.now().strftime("%Y년 %m월 %d일")
+    today = now_kst().strftime("%Y년 %m월 %d일")
     competitor_guide = (
         "취출기 경쟁사 뉴스가 한 건도 없으면 해당 섹션은 아예 출력하지 마세요."
         if category_counts.get("경쟁사", 0) == 0
@@ -518,7 +517,12 @@ def send_kakao_message(text: str) -> bool:
         return False
     url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
     headers = {"Authorization": f"Bearer {KAKAO_ACCESS_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
-    template = {"object_type": "text", "text": text, "link": {"web_url": "https://www.naver.com", "mobile_web_url": "https://www.naver.com"}, "button_title": "뉴스 더 보기"}
+    template = {
+        "object_type": "text",
+        "text": text,
+        "link": {"web_url": "https://www.naver.com", "mobile_web_url": "https://www.naver.com"},
+        "button_title": "뉴스 더 보기"
+    }
     data = {"template_object": json.dumps(template, ensure_ascii=False)}
     resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
     if resp.status_code == 200:
@@ -569,7 +573,7 @@ def _update_env(key: str, value: str) -> None:
 
 
 def build_today_history_records(news_data: dict[str, list[dict[str, str]]]) -> list[dict[str, str]]:
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
     records: list[dict[str, str]] = []
     for category, articles in news_data.items():
         for article in articles:
@@ -588,7 +592,7 @@ def main() -> None:
     global KAKAO_ACCESS_TOKEN, KAKAO_REFRESH_TOKEN
 
     safe_print("\n" + "=" * 50)
-    safe_print(f"  뉴스봇 실행: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    safe_print(f"  뉴스봇 실행: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
     safe_print("=" * 50 + "\n")
 
     try:
