@@ -1,0 +1,15 @@
+# 환경변수 (절대 올리면 안됨!)
+.env
+
+# 발송 이력
+sent_news_history.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 로그
+*.log
