@@ -2,9 +2,9 @@ name: 뉴스봇 자동 발송
 
 on:
   schedule:
-    # 매일 오전 11시 (한국시간) = UTC 02:00
-    - cron: '45 2 * * *'
-  workflow_dispatch:  # 수동 실행 버튼도 활성화
+    - cron: '55 11 * * *'
+      timezone: 'Asia/Seoul'
+  workflow_dispatch:
 
 jobs:
   send-news:
