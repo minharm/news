@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
@@ -50,12 +51,15 @@ except Exception:
 
 NAVER_CLIENT_ID = (os.getenv("NAVER_CLIENT_ID") or "").strip()
 NAVER_CLIENT_SECRET = (os.getenv("NAVER_CLIENT_SECRET") or "").strip()
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
 KAKAO_REST_API_KEY = (os.getenv("KAKAO_REST_API_KEY") or "").strip()
 KAKAO_ACCESS_TOKEN = (os.getenv("KAKAO_ACCESS_TOKEN") or "").strip()
 KAKAO_REFRESH_TOKEN = (os.getenv("KAKAO_REFRESH_TOKEN") or "").strip()
 
 REQUEST_TIMEOUT_NEWS = 10
+REQUEST_TIMEOUT_CLAUDE = 30
 REQUEST_TIMEOUT_KAKAO = 10
+REQUEST_TIMEOUT_ARTICLE = 10
 
 PLACEHOLDER_HINTS = [
     "입력", "여기에", "example", "sample", "replace",
@@ -94,8 +98,16 @@ CATEGORY_MAX_AGE_DAYS = {"플라스틱_사출": 2, "경쟁사": 1}
 
 DEFAULT_HEADER_LINK = "https://www.naver.com"
 DEFAULT_SECTION_IMAGES = {
-    "플라스틱_사출": "https://developers.kakao.com/static/images/pc/txt_visual1.png",
+    "플라스틱_사출": "https://developers.kakao.com/static/images/pc/default.png",
     "경쟁사": "https://developers.kakao.com/static/images/pc/default.png",
+}
+
+ARTICLE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    )
 }
 
 
@@ -126,6 +138,7 @@ def validate_header_env(name: str, value: str | None, *, required: bool = True) 
 def validate_startup_env() -> None:
     validate_header_env("NAVER_CLIENT_ID", NAVER_CLIENT_ID)
     validate_header_env("NAVER_CLIENT_SECRET", NAVER_CLIENT_SECRET)
+    validate_header_env("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
     validate_header_env("KAKAO_ACCESS_TOKEN", KAKAO_ACCESS_TOKEN, required=False)
     validate_header_env("KAKAO_REFRESH_TOKEN", KAKAO_REFRESH_TOKEN, required=False)
     validate_header_env("KAKAO_REST_API_KEY", KAKAO_REST_API_KEY, required=False)
@@ -271,6 +284,7 @@ def search_naver_news(query: str, display: int = 5) -> list[dict[str, str]]:
             "description": strip_html(item.get("description", "")),
             "link": item.get("originallink") or item.get("link") or "",
             "pubDate": item.get("pubDate", ""),
+            "image_url": "",
         })
 
     return results
@@ -543,32 +557,144 @@ def make_short_description(desc: str) -> str:
 
 
 def build_link(url: str) -> dict[str, str]:
-    fallback = DEFAULT_HEADER_LINK
-    final_url = (url or "").strip() or fallback
+    final_url = (url or "").strip() or DEFAULT_HEADER_LINK
     return {
         "web_url": final_url,
         "mobile_web_url": final_url,
     }
 
 
-def article_to_content(article: dict[str, str], rank: int, category: str) -> dict[str, Any]:
-    return {
-        "title": make_short_title(article.get("title", ""), rank),
-        "description": make_short_description(article.get("description", "")),
-        "image_url": DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"]),
-        "image_width": 640,
-        "image_height": 640,
-        "link": build_link(article.get("link", "")),
-    }
+def extract_meta_image(html: str, base_url: str) -> str:
+    patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+        r'<meta[^>]+itemprop=["\']image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+itemprop=["\']image["\']',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if match:
+            image_url = match.group(1).strip()
+            if image_url:
+                return urljoin(base_url, image_url)
+
+    img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    if img_match:
+        return urljoin(base_url, img_match.group(1).strip())
+
+    return ""
 
 
-def build_intro_text() -> str:
+def fetch_article_image(url: str, category: str) -> str:
+    if not url:
+        return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+    try:
+        resp = requests.get(
+            url,
+            headers=ARTICLE_HEADERS,
+            timeout=REQUEST_TIMEOUT_ARTICLE,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+            return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+        html = resp.text[:300000]
+        image_url = extract_meta_image(html, resp.url)
+        if image_url:
+            return image_url
+    except Exception:
+        pass
+
+    return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+
+def enrich_article_images(news_data: dict[str, list[dict[str, str]]]) -> None:
+    for category, articles in news_data.items():
+        for article in articles:
+            if article.get("image_url"):
+                continue
+            article["image_url"] = fetch_article_image(article.get("link", ""), category)
+            safe_print(f"   [이미지] {category} - {trim_text(article.get('title', ''), 28)}")
+
+
+def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
+    total_count = sum(len(v) for v in news_data.values())
+    if total_count == 0:
+        return "오늘은 발송 기준에 맞는 신규 뉴스가 없습니다."
+
+    news_text_parts: list[str] = []
+    for category in ["플라스틱_사출", "경쟁사"]:
+        articles = news_data.get(category, [])
+        if not articles:
+            continue
+
+        label = "플라스틱·사출 업계" if category == "플라스틱_사출" else "취출기 경쟁사"
+        news_text_parts.append(f"\n[{label}]")
+        for article in articles[:3]:
+            news_text_parts.append(
+                f"- 제목: {article.get('title', '')}\n"
+                f"  내용: {article.get('description', '')}"
+            )
+
+    prompt = f"""다음 뉴스들을 보고 카카오톡 상단 인사말에 들어갈 짧은 요약만 작성해 주세요.
+
+[원본 뉴스]
+{chr(10).join(news_text_parts)}
+
+[규칙]
+- 한국어
+- 2줄 이내
+- 첫 줄은 반드시: 안녕하세요!
+- 둘째 줄은 오늘 전체 뉴스 흐름을 한 문장으로 요약
+- 60자 내외
+- 불필요한 이모지 금지
+- 마지막 마침표는 있어도 되고 없어도 됨
+"""
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=REQUEST_TIMEOUT_CLAUDE,
+        )
+        response.raise_for_status()
+
+        data: dict[str, Any] = response.json()
+        content = data.get("content", [])
+        if content and isinstance(content, list):
+            first = content[0]
+            text = first.get("text") if isinstance(first, dict) else None
+            if text:
+                return text.strip()
+    except Exception as e:
+        safe_print(f"[경고] Claude 상단 요약 실패: {e}")
+
+    return "안녕하세요!\n오늘 꼭 챙겨봐야 할 핵심 소식들입니다."
+
+
+def build_intro_text(summary_text: str) -> str:
     today = now_kst().strftime("%Y년 %m월 %d일")
-    return (
-        f"📅 {today} | 뉴스 브리핑\n\n"
-        "안녕하세요!\n"
-        "오늘 꼭 챙겨봐야 할 핵심 소식들입니다."
-    )
+    summary_text = (summary_text or "").strip()
+    if not summary_text:
+        summary_text = "안녕하세요!\n오늘 꼭 챙겨봐야 할 핵심 소식들입니다."
+    return f"📅 {today} | 뉴스 브리핑\n\n{summary_text}"
 
 
 def build_no_news_message() -> str:
@@ -589,17 +715,31 @@ def build_section_header(category: str) -> str:
     return "📍 뉴스"
 
 
+def article_to_content(article: dict[str, str], rank: int, category: str) -> dict[str, Any]:
+    link = build_link(article.get("link", ""))
+    image_url = article.get("image_url") or DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+    return {
+        "title": make_short_title(article.get("title", ""), rank),
+        "description": make_short_description(article.get("description", "")),
+        "imageUrl": image_url,
+        "imageWidth": 640,
+        "imageHeight": 640,
+        "link": link,
+    }
+
+
 def build_list_template(category: str, articles: list[dict[str, str]]) -> dict[str, Any]:
     header_title = build_section_header(category)
-    contents = [article_to_content(article, idx + 1, category) for idx, article in enumerate(articles[:3])]
     first_link = articles[0].get("link", DEFAULT_HEADER_LINK) if articles else DEFAULT_HEADER_LINK
+    contents = [article_to_content(article, idx + 1, category) for idx, article in enumerate(articles[:3])]
 
     return {
         "object_type": "list",
-        "header_title": header_title,
-        "header_link": build_link(first_link),
+        "headerTitle": header_title,
+        "headerLink": build_link(first_link),
         "contents": contents,
-        "button_title": "기사 보기",
+        "buttonTitle": "전체 기사 보기",
         "buttons": [
             {
                 "title": "전체 기사 보기",
@@ -611,24 +751,23 @@ def build_list_template(category: str, articles: list[dict[str, str]]) -> dict[s
 
 def build_feed_template(category: str, article: dict[str, str]) -> dict[str, Any]:
     header_title = build_section_header(category)
-    title = make_short_title(article.get("title", ""), 1)
-    desc = make_short_description(article.get("description", ""))
+    link = build_link(article.get("link", ""))
+    image_url = article.get("image_url") or DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
 
     return {
         "object_type": "feed",
         "content": {
-            "title": f"{header_title}\n\n{title}",
-            "description": desc,
-            "image_url": DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"]),
-            "image_width": 640,
-            "image_height": 640,
-            "link": build_link(article.get("link", "")),
+            "title": header_title,
+            "description": f"{make_short_title(article.get('title', ''), 1)}\n{make_short_description(article.get('description', ''))}",
+            "imageUrl": image_url,
+            "imageWidth": 640,
+            "imageHeight": 640,
+            "link": link,
         },
-        "button_title": "기사 보기",
         "buttons": [
             {
                 "title": "기사 보기",
-                "link": build_link(article.get("link", "")),
+                "link": link,
             }
         ],
     }
@@ -654,10 +793,10 @@ def send_kakao_default_template(template_object: dict[str, Any]) -> bool:
     return False
 
 
-def send_intro_message() -> bool:
+def send_intro_message(summary_text: str) -> bool:
     template = {
         "object_type": "text",
-        "text": build_intro_text(),
+        "text": build_intro_text(summary_text),
         "link": build_link(DEFAULT_HEADER_LINK),
         "button_title": "뉴스 보기",
     }
@@ -802,11 +941,16 @@ def main() -> None:
             safe_print("카카오톡 전송 성공!")
         return
 
-    safe_print("카카오톡 전송 중...")
+    safe_print("기사 이미지 수집 중...")
+    enrich_article_images(news_data)
 
+    safe_print("상단 뉴스 브리핑 요약 생성 중...")
+    intro_summary = summarize_with_claude(news_data)
+
+    safe_print("카카오톡 전송 중...")
     success = True
 
-    if not send_intro_message():
+    if not send_intro_message(intro_summary):
         success = False
         safe_print("[오류] 인트로 메시지 전송 실패")
 
