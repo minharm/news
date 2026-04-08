@@ -102,7 +102,8 @@ DEFAULT_SECTION_IMAGES = {
     "경쟁사": "https://developers.kakao.com/static/images/pc/default.png",
 }
 
-# 반드시 카카오 디벨로퍼스 > 제품 링크 관리에 등록된 도메인으로 바꿔야 함
+# 카카오 링크는 등록된 도메인(minharm.github.io)으로 먼저 들어간 뒤 실제 목적지로 즉시 이동시킨다.
+# news-redirect.html 파일이 GitHub Pages에 있어야 한다.
 REDIRECT_BASE_URL = "https://minharm.github.io/news-redirect.html?url="
 
 ARTICLE_HEADERS = {
@@ -561,7 +562,7 @@ def make_short_description(desc: str) -> str:
 
 def build_registered_redirect_url(article_url: str) -> str:
     if not article_url:
-        return DEFAULT_HEADER_LINK
+        article_url = DEFAULT_HEADER_LINK
     return REDIRECT_BASE_URL + quote(article_url, safe="")
 
 
@@ -571,6 +572,12 @@ def build_link(url: str) -> dict[str, str]:
         "web_url": final_url,
         "mobile_web_url": final_url,
     }
+
+
+def build_homepage_link() -> dict[str, str]:
+    # 인트로 버튼도 반드시 redirect 페이지를 거치도록 통일
+    # 그래야 카카오에서 등록 도메인 외부 링크 처리 시 minharm.github.io 루트로 빠지는 문제를 줄일 수 있다.
+    return build_link(DEFAULT_HEADER_LINK)
 
 
 def extract_meta_image(html: str, base_url: str) -> str:
@@ -808,15 +815,10 @@ def send_kakao_default_template(template_object: dict[str, Any]) -> bool:
 
 
 def send_intro_message(summary_text: str) -> bool:
-    intro_link = {
-        "web_url": "http://www.abimaneng.com/",
-        "mobile_web_url": "http://www.abimaneng.com/",
-    }
-
     template = {
         "object_type": "text",
         "text": build_intro_text(summary_text),
-        "link": intro_link,
+        "link": build_homepage_link(),
         "button_title": "아비만로보틱스홈페이지",
     }
 
@@ -956,7 +958,7 @@ def main() -> None:
         ok = send_kakao_default_template({
             "object_type": "text",
             "text": build_no_news_message(),
-            "link": build_link(DEFAULT_HEADER_LINK),
+            "link": build_homepage_link(),
             "button_title": "확인",
         })
         if ok:
