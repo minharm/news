@@ -96,7 +96,7 @@ COMPETITOR_QUERIES: list[str] = [
 
 CATEGORY_MAX_AGE_DAYS = {"플라스틱_사출": 2, "경쟁사": 1}
 
-DEFAULT_HEADER_LINK = "https://www.naver.com"
+DEFAULT_HEADER_LINK = "http://www.abimaneng.com/"
 DEFAULT_SECTION_IMAGES = {
     "플라스틱_사출": "https://developers.kakao.com/static/images/pc/default.png",
     "경쟁사": "https://developers.kakao.com/static/images/pc/default.png",
@@ -748,6 +748,13 @@ def build_list_template(category: str, articles: list[dict[str, str]]) -> dict[s
         "header_title": header_title,
         "header_link": build_link(first_link),
         "contents": contents,
+        "button_title": "전체 기사 보기",
+        "buttons": [
+            {
+                "title": "전체 기사 보기",
+                "link": build_link(first_link),
+            }
+        ],
     }
 
 
@@ -767,6 +774,13 @@ def build_feed_template(category: str, article: dict[str, str]) -> dict[str, Any
             "image_height": 640,
             "link": build_link(article.get("link", "")),
         },
+        "button_title": "전체 기사 보기",
+        "buttons": [
+            {
+                "title": "전체 기사 보기",
+                "link": build_link(article.get("link", "")),
+            }
+        ],
     }
 
 
@@ -797,7 +811,11 @@ def send_intro_message(summary_text: str) -> bool:
     template = {
         "object_type": "text",
         "text": build_intro_text(summary_text),
-        "link": build_link(DEFAULT_HEADER_LINK),
+        "link": {
+            "web_url": "http://www.abimaneng.com/",
+            "mobile_web_url": "http://www.abimaneng.com/",
+        },
+        "button_title": "아비만로보틱스홈페이지",
     }
     return send_kakao_default_template(template)
 
