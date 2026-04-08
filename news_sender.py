@@ -92,9 +92,6 @@ COMPETITOR_QUERIES: list[str] = [
     "TOPSTAR robot",
 ]
 
-# 오래된 기사 차단 강화
-# 플라스틱·사출: 0~2일
-# 경쟁사: 0~1일
 CATEGORY_MAX_AGE_DAYS = {"플라스틱_사출": 2, "경쟁사": 1}
 
 
@@ -276,7 +273,6 @@ def search_naver_news(query: str, display: int = 5) -> list[dict[str, str]]:
     return results
 
 
-# 중복 기사 묶기 강화
 def group_similar_articles(articles: list[dict[str, str]], category: str) -> list[dict[str, str]]:
     groups: list[list[dict[str, str]]] = []
 
@@ -363,7 +359,6 @@ def save_history(today_records: list[dict[str, str]]) -> None:
         safe_print(f"[경고] 발송 이력 저장 실패: {e}")
 
 
-# 최근 발송 이력 중복 기준 강화
 def is_recent_duplicate(article: dict[str, str], recent_history: list[dict[str, str]]) -> bool:
     title = article.get("title", "")
     link = article.get("link", "")
@@ -407,7 +402,6 @@ def get_recent_history(days: int = 3) -> list[dict[str, str]]:
     return [x for x in history if x.get("date", "") >= cutoff]
 
 
-# 오늘 수집분끼리도 중복 차단
 def filter_recent_duplicates(articles: list[dict[str, str]]) -> list[dict[str, str]]:
     recent = get_recent_history(days=3)
     kept: list[dict[str, str]] = []
@@ -569,47 +563,34 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
 - 취출기 경쟁사: {category_counts.get("경쟁사", 0)}건
 
 [작성 규칙]
-- 전체 톤은 정돈된 비즈니스 뉴스레터 스타일로 작성
-- 과한 이모지, 과장 표현, 불필요한 감탄 표현은 사용 금지
-- 이모지는 제목 줄의 신문 아이콘 1개만 허용
-- 맨 위 제목은 반드시 다음 형식으로 작성:
-  "{today} | 오늘의 뉴스 브리핑 📰"
-- 제목 아래에는 아래 형식으로 인사말 2줄을 작성
-  1줄: "안녕하세요."
-  2줄: 오늘 전체 뉴스 흐름을 요약하는 한 줄 코멘트
+1. 전체 톤은 정돈된 비즈니스 뉴스레터 스타일로 작성하세요.
+2. 맨 위 제목은 반드시 다음 형식을 사용하세요 (마크다운 사용 금지):
+   {today} | 오늘의 뉴스 브리핑 📰
 
-- 섹션 순서는 반드시:
-  1. 플라스틱·사출 업계
-  2. 취출기 경쟁사
+3. 제목 아래 인사말 2줄을 작성하세요:
+   안녕하세요.
+   (오늘의 뉴스 요약 코멘트 한 줄)
 
-- 각 섹션은 실제 수집된 뉴스가 있을 때만 출력
-- {competitor_guide}
+4. 섹션 구분은 반드시 다음 스타일을 사용하세요:
+   ━━━━━━━━━━
+   📍 플라스틱·사출 업계
+   ━━━━━━━━━━
 
-- 각 섹션 제목은 반드시 아래처럼 구분선을 포함해 작성:
-━━━━━━━━━━
-플라스틱·사출 업계
-━━━━━━━━━━
+   ━━━━━━━━━━
+   📍 취출기 경쟁사
+   ━━━━━━━━━━
 
-━━━━━━━━━━
-취출기 경쟁사
-━━━━━━━━━━
+5. 각 뉴스는 반드시 아래 형식으로 작성하며 항목 사이에는 한 줄의 공백을 두어 가독성을 높이세요:
+   (숫자)번. 짧은 제목 (16~26자 내외로 핵심만 요약)
+   • 핵심 내용 한 줄 요약
+   🔗 기사 원문
+   (실제 링크주소)
 
-- 각 뉴스는 반드시 아래 형식으로 작성:
-  1) 짧은 제목
-  - 핵심 내용 한 줄 요약
-  기사 원문
-  링크주소
-
-- "링크", "원문 링크", "URL" 같은 표현 대신 반드시 "기사 원문" 이라고만 작성
-- "기사 원문" 다음 줄에 실제 링크 주소를 그대로 넣을 것
-- 기사 제목을 길게 그대로 복붙하지 말고, 16~26자 내외의 짧은 제목으로 정리
-- 핵심 내용은 1문장으로만 작성
-- 유사 기사 묶음이라고 표시된 경우, 묶인 기사의 공통 핵심 이슈로 자연스럽게 요약
-- 원본 뉴스에 없는 사실은 절대 추가하지 말 것
-- 각 카테고리는 수집된 기사만 기준으로 최대 3건 출력
-- 전체 길이는 1,100자 이내
-- 마지막 문구는 반드시: "아비만 뉴스봇 자동 발송 메시지입니다."
-- 마크다운 굵게(**)는 사용하지 말 것
+6. {competitor_guide}
+7. 과도한 이모지는 피하되, 지시한 📍, •, 🔗, 📰 만 사용하세요.
+8. 마크다운 굵게(**) 등 카카오톡에서 깨질 수 있는 특수 서식은 절대 사용하지 마세요.
+9. 전체 길이는 1,100자 이내로 작성하세요.
+10. 마지막 문구는 반드시: "아비만 뉴스봇 자동 발송 메시지입니다."
 '''
 
     response = requests.post(
@@ -620,7 +601,7 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
             "content-type": "application/json",
         },
         json={
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-3-5-sonnet-20240620",
             "max_tokens": 1500,
             "messages": [{"role": "user", "content": prompt}],
         },
