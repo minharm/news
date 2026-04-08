@@ -808,15 +808,19 @@ def send_kakao_default_template(template_object: dict[str, Any]) -> bool:
 
 
 def send_intro_message(summary_text: str) -> bool:
+    intro_link = {
+        "web_url": "http://www.abimaneng.com/",
+        "mobile_web_url": "http://www.abimaneng.com/",
+    }
+
     template = {
         "object_type": "text",
         "text": build_intro_text(summary_text),
-        "link": {
-            "web_url": "http://www.abimaneng.com/",
-            "mobile_web_url": "http://www.abimaneng.com/",
-        },
+        "link": intro_link,
         "button_title": "아비만로보틱스홈페이지",
     }
+
+    safe_print("[인트로 템플릿]", json.dumps(template, ensure_ascii=False, indent=2))
     return send_kakao_default_template(template)
 
 
