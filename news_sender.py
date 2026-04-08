@@ -103,7 +103,7 @@ DEFAULT_SECTION_IMAGES = {
 }
 
 # 반드시 카카오 디벨로퍼스 > 제품 링크 관리에 등록된 도메인으로 바꿔야 함
-REDIRECT_BASE_URL = "https://YOUR-DOMAIN.com/news-redirect?url="
+REDIRECT_BASE_URL = "https://minharm.github.io/news-redirect.html?url="
 
 ARTICLE_HEADERS = {
     "User-Agent": (
