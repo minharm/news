@@ -748,13 +748,6 @@ def build_list_template(category: str, articles: list[dict[str, str]]) -> dict[s
         "header_title": header_title,
         "header_link": build_link(first_link),
         "contents": contents,
-        "button_title": "전체 기사 보기",
-        "buttons": [
-            {
-                "title": "전체 기사 보기",
-                "link": build_link(first_link),
-            }
-        ],
     }
 
 
@@ -774,13 +767,6 @@ def build_feed_template(category: str, article: dict[str, str]) -> dict[str, Any
             "image_height": 640,
             "link": build_link(article.get("link", "")),
         },
-        "button_title": "기사 보기",
-        "buttons": [
-            {
-                "title": "기사 보기",
-                "link": build_link(article.get("link", "")),
-            }
-        ],
     }
 
 
@@ -812,7 +798,6 @@ def send_intro_message(summary_text: str) -> bool:
         "object_type": "text",
         "text": build_intro_text(summary_text),
         "link": build_link(DEFAULT_HEADER_LINK),
-        "button_title": "뉴스 보기",
     }
     return send_kakao_default_template(template)
 
