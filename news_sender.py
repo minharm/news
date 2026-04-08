@@ -516,6 +516,55 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
     return collected, stats
 
 
+def normalize_generated_newsletter(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+
+    replacements = {
+        "📌 ": "📍 ",
+        "📌": "📍",
+        "기사 원문 보기": "🔗 기사 보기",
+        "기사 원문": "🔗 기사 보기",
+        "원문 링크": "🔗 기사 보기",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"(?m)^\[플라스틱[·ㆍ]사출 업계\]$", "📍 [플라스틱·사출 업계]", text)
+    text = re.sub(r"(?m)^플라스틱[·ㆍ]사출 업계$", "📍 [플라스틱·사출 업계]", text)
+    text = re.sub(r"(?m)^\[취출기 경쟁사\]$", "📍 [취출기 경쟁사]", text)
+    text = re.sub(r"(?m)^취출기 경쟁사$", "📍 [취출기 경쟁사]", text)
+
+    def bold_numbered_title(match: re.Match[str]) -> str:
+        num = match.group(1)
+        title = match.group(2).strip()
+        if title.startswith("*") and title.endswith("*"):
+            return f"{num}. {title}"
+        return f"{num}. *{title}*"
+
+    text = re.sub(r"(?m)^(\d+)\.\s+(?!\*)(.+)$", bold_numbered_title, text)
+
+    lines = [line.rstrip() for line in text.split("\n")]
+    cleaned: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        if line.startswith("http://") or line.startswith("https://"):
+            if cleaned and cleaned[-1].strip() != "🔗 기사 보기":
+                cleaned.append("🔗 기사 보기")
+            cleaned.append(line)
+            cleaned.append("")
+            i += 1
+            continue
+
+        cleaned.append(lines[i].rstrip())
+        i += 1
+
+    text = "\n".join(cleaned)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
 def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
     total_count = sum(len(v) for v in news_data.values())
     if total_count == 0:
@@ -553,7 +602,7 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
         else "취출기 경쟁사 섹션은 실제 수집된 기사만 포함하세요."
     )
 
-    prompt = f'''오늘({today}) 뉴스를 카카오톡 메시지용 깔끔한 뉴스레터 형식으로 정리해 주세요.
+    prompt = f'''오늘({today}) 뉴스를 카카오톡 모바일용 텍스트 뉴스레터 형식으로 정리해 주세요.
 
 [원본 뉴스]
 {news_text}
@@ -562,35 +611,40 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
 - 플라스틱·사출 업계: {category_counts.get("플라스틱_사출", 0)}건
 - 취출기 경쟁사: {category_counts.get("경쟁사", 0)}건
 
-[작성 규칙]
-1. 전체 톤은 정돈된 비즈니스 뉴스레터 스타일로 작성하세요.
-2. 맨 위 제목은 반드시 다음 형식을 사용하세요 (마크다운 사용 금지):
-   {today} | 오늘의 뉴스 브리핑 📰
+[반드시 지킬 출력 형식]
+- HTML, 마크다운 헤더(#), 코드블록, 표 사용 금지
+- 카카오톡 모바일 기본 텍스트 메시지에서 보기 좋게 plain text로만 작성
+- 맨 위 제목은 반드시 정확히:
+📅 {today} | 뉴스 브리핑
 
-3. 제목 아래 인사말 2줄을 작성하세요:
-   안녕하세요.
-   (오늘의 뉴스 요약 코멘트 한 줄)
+- 제목 아래에는 아래 문장 1줄:
+안녕하세요! 오늘 꼭 챙겨봐야 할 핵심 소식들입니다.
 
-4. 섹션 구분은 반드시 다음 스타일을 사용하세요:
-   ━━━━━━━━━━
-   📍 플라스틱·사출 업계
-   ━━━━━━━━━━
+- 섹션 제목은 반드시 아래 형식만 사용
+📍 [플라스틱·사출 업계]
+📍 [취출기 경쟁사]
 
-   ━━━━━━━━━━
-   📍 취출기 경쟁사
-   ━━━━━━━━━━
+- 개별 뉴스는 반드시 아래 형식으로만 작성
+1. *짧은 제목*
+🔗 기사 보기
+실제링크주소
+• 핵심 내용 1줄
+• 핵심 내용 1줄
 
-5. 각 뉴스는 반드시 아래 형식으로 작성하며 항목 사이에는 한 줄의 공백을 두어 가독성을 높이세요:
-   (숫자)번. 짧은 제목 (16~26자 내외로 핵심만 요약)
-   • 핵심 내용 한 줄 요약
-   🔗 기사 원문
-   (실제 링크주소)
-
-6. {competitor_guide}
-7. 과도한 이모지는 피하되, 지시한 📍, •, 🔗, 📰 만 사용하세요.
-8. 마크다운 굵게(**) 등 카카오톡에서 깨질 수 있는 특수 서식은 절대 사용하지 마세요.
-9. 전체 길이는 1,100자 이내로 작성하세요.
-10. 마지막 문구는 반드시: "아비만 뉴스봇 자동 발송 메시지입니다."
+- 기사 링크는 반드시 제목 바로 아래 배치
+- 제목은 숫자로 구분하고, 제목 양옆만 별표(*)로 감싸기
+- 각 뉴스 항목 사이에는 반드시 빈 줄 1줄 넣기
+- 각 섹션 사이에도 빈 줄 1줄 넣기
+- 제목은 길게 복붙하지 말고 16~26자 내외로 짧게 정리
+- 핵심 내용은 기사 내용을 바탕으로 1~2줄 bullet로만 작성
+- 불필요한 장식 문자, 구분선, 과한 이모지 사용 금지
+- 섹션 제목 앞 이모지는 반드시 📍만 사용
+- 링크 안내 문구는 반드시 "🔗 기사 보기"만 사용
+- {competitor_guide}
+- 원본 뉴스에 없는 사실은 절대 추가하지 말 것
+- 전체 길이는 1,300자 이내
+- 마지막 줄은 반드시:
+아비만 뉴스봇 자동 발송 메시지입니다.
 '''
 
     response = requests.post(
@@ -601,7 +655,7 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
             "content-type": "application/json",
         },
         json={
-            "model": "claude-3-5-sonnet-20240620",
+            "model": "claude-sonnet-4-20250514",
             "max_tokens": 1500,
             "messages": [{"role": "user", "content": prompt}],
         },
@@ -619,14 +673,14 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
     if not text:
         raise ValueError(f"Claude 응답 본문이 비어 있습니다: {data}")
 
-    return text
+    return normalize_generated_newsletter(text)
 
 
 def build_no_news_message() -> str:
     today = now_kst().strftime("%Y년 %m월 %d일")
     return (
-        f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
-        "안녕하세요.\n"
+        f"📅 {today} | 뉴스 브리핑\n\n"
+        "안녕하세요! 오늘 꼭 챙겨봐야 할 핵심 소식들입니다.\n\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
         "아비만 뉴스봇 자동 발송 메시지입니다."
     )
