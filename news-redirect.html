@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Redirect</title>
+  <meta http-equiv="refresh" content="0;url=http://www.abimaneng.com/">
+  <script>
+    (function () {
+      try {
+        var params = new URLSearchParams(window.location.search);
+        var target = params.get("url") || "http://www.abimaneng.com/";
+        window.location.replace(target);
+      } catch (e) {
+        window.location.href = "http://www.abimaneng.com/";
+      }
+    })();
+  </script>
+</head>
+<body>
+  <p>이동 중입니다...</p>
+</body>
+</html>
