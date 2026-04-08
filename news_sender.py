@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from zoneinfo import ZoneInfo
 
 import requests
@@ -101,6 +101,9 @@ DEFAULT_SECTION_IMAGES = {
     "플라스틱_사출": "https://developers.kakao.com/static/images/pc/default.png",
     "경쟁사": "https://developers.kakao.com/static/images/pc/default.png",
 }
+
+# 반드시 카카오 디벨로퍼스 > 제품 링크 관리에 등록된 도메인으로 바꿔야 함
+REDIRECT_BASE_URL = "https://YOUR-DOMAIN.com/news-redirect?url="
 
 ARTICLE_HEADERS = {
     "User-Agent": (
@@ -556,8 +559,14 @@ def make_short_description(desc: str) -> str:
     return trim_text(desc, 55)
 
 
+def build_registered_redirect_url(article_url: str) -> str:
+    if not article_url:
+        return DEFAULT_HEADER_LINK
+    return REDIRECT_BASE_URL + quote(article_url, safe="")
+
+
 def build_link(url: str) -> dict[str, str]:
-    final_url = (url or "").strip() or DEFAULT_HEADER_LINK
+    final_url = build_registered_redirect_url(url)
     return {
         "web_url": final_url,
         "mobile_web_url": final_url,
@@ -654,9 +663,8 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
 - 2줄 이내
 - 첫 줄은 반드시: 안녕하세요!
 - 둘째 줄은 오늘 전체 뉴스 흐름을 한 문장으로 요약
-- 60자 내외
+- 70자 내외
 - 불필요한 이모지 금지
-- 마지막 마침표는 있어도 되고 없어도 됨
 """
 
     try:
@@ -694,13 +702,13 @@ def build_intro_text(summary_text: str) -> str:
     summary_text = (summary_text or "").strip()
     if not summary_text:
         summary_text = "안녕하세요!\n오늘 꼭 챙겨봐야 할 핵심 소식들입니다."
-    return f"📅 {today} | 뉴스 브리핑\n\n{summary_text}"
+    return f"📰 {today} | 뉴스 브리핑\n\n{summary_text}"
 
 
 def build_no_news_message() -> str:
     today = now_kst().strftime("%Y년 %m월 %d일")
     return (
-        f"📅 {today} | 뉴스 브리핑\n\n"
+        f"📰 {today} | 뉴스 브리핑\n\n"
         "안녕하세요!\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
         "아비만 뉴스봇 자동 발송 메시지입니다."
@@ -716,16 +724,17 @@ def build_section_header(category: str) -> str:
 
 
 def article_to_content(article: dict[str, str], rank: int, category: str) -> dict[str, Any]:
-    link = build_link(article.get("link", ""))
-    image_url = article.get("image_url") or DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+    image_url = article.get("image_url") or DEFAULT_SECTION_IMAGES.get(
+        category, DEFAULT_SECTION_IMAGES["플라스틱_사출"]
+    )
 
     return {
         "title": make_short_title(article.get("title", ""), rank),
         "description": make_short_description(article.get("description", "")),
-        "imageUrl": image_url,
-        "imageWidth": 640,
-        "imageHeight": 640,
-        "link": link,
+        "image_url": image_url,
+        "image_width": 640,
+        "image_height": 640,
+        "link": build_link(article.get("link", "")),
     }
 
 
@@ -736,10 +745,10 @@ def build_list_template(category: str, articles: list[dict[str, str]]) -> dict[s
 
     return {
         "object_type": "list",
-        "headerTitle": header_title,
-        "headerLink": build_link(first_link),
+        "header_title": header_title,
+        "header_link": build_link(first_link),
         "contents": contents,
-        "buttonTitle": "전체 기사 보기",
+        "button_title": "전체 기사 보기",
         "buttons": [
             {
                 "title": "전체 기사 보기",
@@ -751,23 +760,25 @@ def build_list_template(category: str, articles: list[dict[str, str]]) -> dict[s
 
 def build_feed_template(category: str, article: dict[str, str]) -> dict[str, Any]:
     header_title = build_section_header(category)
-    link = build_link(article.get("link", ""))
-    image_url = article.get("image_url") or DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+    image_url = article.get("image_url") or DEFAULT_SECTION_IMAGES.get(
+        category, DEFAULT_SECTION_IMAGES["플라스틱_사출"]
+    )
 
     return {
         "object_type": "feed",
         "content": {
             "title": header_title,
             "description": f"{make_short_title(article.get('title', ''), 1)}\n{make_short_description(article.get('description', ''))}",
-            "imageUrl": image_url,
-            "imageWidth": 640,
-            "imageHeight": 640,
-            "link": link,
+            "image_url": image_url,
+            "image_width": 640,
+            "image_height": 640,
+            "link": build_link(article.get("link", "")),
         },
+        "button_title": "기사 보기",
         "buttons": [
             {
                 "title": "기사 보기",
-                "link": link,
+                "link": build_link(article.get("link", "")),
             }
         ],
     }
@@ -786,10 +797,13 @@ def send_kakao_default_template(template_object: dict[str, Any]) -> bool:
     data = {"template_object": json.dumps(template_object, ensure_ascii=False)}
 
     resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+
+    safe_print(f"[카카오 응답] status={resp.status_code}")
+    safe_print(f"[카카오 응답 본문] {resp.text}")
+
     if resp.status_code == 200:
         return True
 
-    safe_print(f"카카오톡 전송 실패: {resp.status_code} - {resp.text}")
     return False
 
 
@@ -812,6 +826,7 @@ def send_section_message(category: str, articles: list[dict[str, str]]) -> bool:
     else:
         template = build_feed_template(category, articles[0])
 
+    safe_print(f"[전송 템플릿] {json.dumps(template, ensure_ascii=False, indent=2)}")
     return send_kakao_default_template(template)
 
 
