@@ -100,7 +100,10 @@ COMPETITOR_QUERIES: list[str] = [
     "TOPSTAR robot",
 ]
 
-CATEGORY_MAX_AGE_DAYS = {"플라스틱_사출": 3, "경쟁사": 2}
+# 6번 반영: 오래된 기사 기준 강화
+# 플라스틱/사출: 0~2일
+# 경쟁사: 0~1일
+CATEGORY_MAX_AGE_DAYS = {"플라스틱_사출": 2, "경쟁사": 1}
 
 
 def _looks_like_placeholder(value: str) -> bool:
@@ -214,7 +217,7 @@ def get_article_age_days(article: dict[str, str]) -> int | None:
 
 def is_fresh_enough(article: dict[str, str], category: str) -> bool:
     age_days = get_article_age_days(article)
-    max_days = CATEGORY_MAX_AGE_DAYS.get(category, 3)
+    max_days = CATEGORY_MAX_AGE_DAYS.get(category, 2)
     if age_days is None:
         return False
     return age_days <= max_days
@@ -241,11 +244,11 @@ def article_score(article: dict[str, str], category: str) -> int:
     age_days = get_article_age_days(article)
     if age_days is not None:
         if age_days == 0:
-            score += 4
+            score += 5
         elif age_days == 1:
             score += 2
-        elif age_days >= 2:
-            score -= age_days
+        else:
+            score -= age_days * 2
     return score
 
 
@@ -267,37 +270,63 @@ def search_naver_news(query: str, display: int = 5) -> list[dict[str, str]]:
     return results
 
 
+# 5번 반영: 같은 회사 + 유사 키워드면 더 적극적으로 묶기
 def group_similar_articles(articles: list[dict[str, str]], category: str) -> list[dict[str, str]]:
     groups: list[list[dict[str, str]]] = []
     for article in articles:
         title = article.get("title", "")
         company = extract_matched_company(title)
+        fp = build_fingerprint(article)
         matched = False
+
         for group in groups:
             rep = group[0]
             rep_title = rep.get("title", "")
             rep_company = extract_matched_company(rep_title)
+            rep_fp = build_fingerprint(rep)
             sim = token_similarity(title, rep_title)
             same_company = bool(company and rep_company and company == rep_company)
-            if sim >= 0.58 or (same_company and sim >= 0.35):
+
+            if fp and rep_fp and fp == rep_fp:
                 group.append(article)
                 matched = True
                 break
+
+            if sim >= 0.60:
+                group.append(article)
+                matched = True
+                break
+
+            if same_company and sim >= 0.42:
+                group.append(article)
+                matched = True
+                break
+
         if not matched:
             groups.append([article])
+
     selected: list[dict[str, str]] = []
     for group in groups:
         ranked = sorted(
             group,
-            key=lambda x: (article_score(x, category), len(x.get("description", "")), len(x.get("title", ""))),
-            reverse=True
+            key=lambda x: (
+                article_score(x, category),
+                len(x.get("description", "")),
+                len(x.get("title", "")),
+            ),
+            reverse=True,
         )
         chosen = dict(ranked[0])
         chosen["_group_size"] = str(len(group))
         selected.append(chosen)
+
     selected.sort(
-        key=lambda x: (article_score(x, category), int(x.get("_group_size", "1")), len(x.get("description", ""))),
-        reverse=True
+        key=lambda x: (
+            article_score(x, category),
+            int(x.get("_group_size", "1")),
+            len(x.get("description", "")),
+        ),
+        reverse=True,
     )
     return selected
 
@@ -327,24 +356,42 @@ def save_history(today_records: list[dict[str, str]]) -> None:
         safe_print(f"[경고] 발송 이력 저장 실패: {e}")
 
 
+# 5번 반영: 최근 발송 이력 중복 기준 강화
 def is_recent_duplicate(article: dict[str, str], recent_history: list[dict[str, str]]) -> bool:
     title = article.get("title", "")
     link = article.get("link", "")
     fp = build_fingerprint(article)
     company = extract_matched_company(title)
+    pub_dt = parse_pubdate(article.get("pubDate", ""))
+
     for hist in recent_history:
         if link and hist.get("link") == link:
             return True
+
         hist_title = hist.get("title", "")
         hist_fp = hist.get("fingerprint", "")
         hist_company = hist.get("company", "")
+        hist_date = hist.get("date", "")
         sim = token_similarity(title, hist_title)
+
         if fp and hist_fp and fp == hist_fp:
             return True
-        if sim >= 0.72:
+
+        if sim >= 0.68:
             return True
-        if company and hist_company and company == hist_company and sim >= 0.50:
+
+        if company and hist_company and company == hist_company and sim >= 0.42:
             return True
+
+        # 같은 회사 기사인데 제목이 조금 달라도 2일 이내 동일 이슈로 보고 차단
+        if company and hist_company and company == hist_company and hist_date and pub_dt is not None:
+            try:
+                hist_dt = datetime.strptime(hist_date, "%Y-%m-%d").replace(tzinfo=KST)
+                if abs((pub_dt.date() - hist_dt.date()).days) <= 2 and sim >= 0.30:
+                    return True
+            except Exception:
+                pass
+
     return False
 
 
@@ -354,12 +401,35 @@ def get_recent_history(days: int = 3) -> list[dict[str, str]]:
     return [x for x in history if x.get("date", "") >= cutoff]
 
 
+# 5번 반영: 오늘 수집분끼리도 한 번 더 중복 차단
 def filter_recent_duplicates(articles: list[dict[str, str]]) -> list[dict[str, str]]:
     recent = get_recent_history(days=3)
     kept: list[dict[str, str]] = []
+
     for article in articles:
-        if not is_recent_duplicate(article, recent):
+        if is_recent_duplicate(article, recent):
+            continue
+
+        duplicate_inside_kept = False
+        for saved in kept:
+            sim = token_similarity(article.get("title", ""), saved.get("title", ""))
+            same_company = (
+                extract_matched_company(article.get("title", "")) and
+                extract_matched_company(article.get("title", "")) == extract_matched_company(saved.get("title", ""))
+            )
+            if build_fingerprint(article) == build_fingerprint(saved):
+                duplicate_inside_kept = True
+                break
+            if sim >= 0.65:
+                duplicate_inside_kept = True
+                break
+            if same_company and sim >= 0.40:
+                duplicate_inside_kept = True
+                break
+
+        if not duplicate_inside_kept:
             kept.append(article)
+
     return kept
 
 
@@ -392,7 +462,12 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
         reverse=True
     )
     collected["플라스틱_사출"] = final_plastic[:category_limits["플라스틱_사출"]]
-    stats["플라스틱_사출"] = {"raw": len(raw_plastic), "grouped": len(grouped_plastic), "fresh": len(fresh_plastic), "final": len(collected["플라스틱_사출"])}
+    stats["플라스틱_사출"] = {
+        "raw": len(raw_plastic),
+        "grouped": len(grouped_plastic),
+        "fresh": len(fresh_plastic),
+        "final": len(collected["플라스틱_사출"]),
+    }
 
     raw_competitor: list[dict[str, str]] = []
     for q in COMPETITOR_QUERIES:
@@ -422,7 +497,13 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
         reverse=True
     )
     collected["경쟁사"] = final_competitor[:category_limits["경쟁사"]]
-    stats["경쟁사"] = {"raw": len(raw_competitor), "company_filtered": len(company_filtered), "grouped": len(grouped_competitor), "fresh": len(fresh_competitor), "final": len(collected["경쟁사"])}
+    stats["경쟁사"] = {
+        "raw": len(raw_competitor),
+        "company_filtered": len(company_filtered),
+        "grouped": len(grouped_competitor),
+        "fresh": len(fresh_competitor),
+        "final": len(collected["경쟁사"]),
+    }
 
     return collected, stats
 
@@ -431,9 +512,11 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
     total_count = sum(len(v) for v in news_data.values())
     if total_count == 0:
         raise ValueError("요약할 뉴스가 없습니다.")
+
     label_map = {"플라스틱_사출": "플라스틱·사출 업계", "경쟁사": "취출기 경쟁사"}
     news_text_parts: list[str] = []
     category_counts: dict[str, int] = {}
+
     for category in ["플라스틱_사출", "경쟁사"]:
         articles = news_data.get(category, [])
         label = label_map[category]
@@ -450,6 +533,7 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
                 f"  내용: {article['description']}\n"
                 f"  링크: {article['link']}"
             )
+
     news_text = "\n".join(news_text_parts)
     today = now_kst().strftime("%Y년 %m월 %d일")
     competitor_guide = (
@@ -457,6 +541,7 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
         if category_counts.get("경쟁사", 0) == 0
         else "취출기 경쟁사 섹션은 실제 수집된 기사만 포함하세요."
     )
+
     prompt = f'''오늘({today}) 뉴스를 카카오톡 메시지용 깔끔한 뉴스레터 형식으로 정리해 주세요.
 
 [원본 뉴스]
@@ -495,8 +580,16 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
 '''
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json={"model": "claude-sonnet-4-20250514", "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": prompt}],
+        },
         timeout=REQUEST_TIMEOUT_CLAUDE,
     )
     response.raise_for_status()
@@ -511,12 +604,26 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
     return text
 
 
+# 8번 반영: 뉴스 0건용 정식 메시지
+def build_no_news_message() -> str:
+    today = now_kst().strftime("%Y년 %m월 %d일")
+    return (
+        f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
+        "안녕하세요.\n"
+        "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
+        "아비만 뉴스봇 자동 발송 메시지입니다."
+    )
+
+
 def send_kakao_message(text: str) -> bool:
     if not KAKAO_ACCESS_TOKEN:
         safe_print("KAKAO_ACCESS_TOKEN 이 없어 카카오톡 전송을 할 수 없습니다.")
         return False
     url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
-    headers = {"Authorization": f"Bearer {KAKAO_ACCESS_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
+    headers = {
+        "Authorization": f"Bearer {KAKAO_ACCESS_TOKEN}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
     template = {
         "object_type": "text",
         "text": text,
@@ -626,7 +733,8 @@ def main() -> None:
     safe_print(f"      [경쟁사] raw {c.get('raw',0)} -> 업체필터 {c.get('company_filtered',0)} -> grouped {c.get('grouped',0)} -> fresh {c.get('fresh',0)} -> final {c.get('final',0)}")
 
     if total == 0:
-        safe_print("수집된 뉴스가 없어 요약 및 전송을 중단합니다.")
+        safe_print("수집 기준에 맞는 신규 뉴스가 없어 안내 메시지를 전송합니다.")
+        send_kakao_message(build_no_news_message())
         return
 
     safe_print("Claude AI로 요약 중...")
