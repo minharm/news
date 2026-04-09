@@ -95,7 +95,6 @@ COMPETITOR_QUERIES: list[str] = [
     "WITTMANN robot",
     "TOPSTAR robot",
 ]
-COMPETITOR_MIN_SIMILARITY = 0.1
 
 # 오래된 기사 차단 강화
 # 플라스틱·사출: 0~2일
@@ -465,17 +464,6 @@ def filter_recent_duplicates(articles: list[dict[str, str]]) -> list[dict[str, s
     return kept
 
 
-def competitor_similarity(article: dict[str, str]) -> float:
-    title = article.get("title", "")
-    desc = article.get("description", "")
-    combined = f"{title} {desc}".strip()
-    if not combined:
-        return 0.0
-
-    scores = [token_similarity(combined, query) for query in COMPETITOR_QUERIES]
-    return max(scores) if scores else 0.0
-
-
 def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[str, int]]]:
     plastic_queries = ["플라스틱 산업 동향", "사출성형 업계", "플라스틱 원자재 가격"]
     category_limits = {"플라스틱_사출": 3, "경쟁사": 3}
@@ -538,18 +526,9 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
 
     grouped_competitor = group_similar_articles(company_filtered, "경쟁사")
     fresh_competitor = [a for a in grouped_competitor if is_fresh_enough(a, "경쟁사")]
-    similar_competitor = [
-        a for a in fresh_competitor
-        if competitor_similarity(a) >= COMPETITOR_MIN_SIMILARITY
-    ]
-    low_sim_blocked = len(fresh_competitor) - len(similar_competitor)
-    if low_sim_blocked > 0:
-        safe_print(f"   [경쟁사 유사도 필터] 낮은 유사도 기사 {low_sim_blocked}건 제외됨")
-
-    final_competitor = filter_recent_duplicates(similar_competitor)
+    final_competitor = filter_recent_duplicates(fresh_competitor)
     final_competitor.sort(
         key=lambda x: (
-            competitor_similarity(x),
             article_score(x, "경쟁사"),
             int(x.get("_group_size", "1")),
             len(x.get("description", "")),
@@ -562,7 +541,6 @@ def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[
         "company_filtered": len(company_filtered),
         "grouped": len(grouped_competitor),
         "fresh": len(fresh_competitor),
-        "similar": len(similar_competitor),
         "final": len(collected["경쟁사"]),
     }
 
@@ -695,7 +673,7 @@ def build_no_news_message() -> str:
         f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
         "안녕하세요.\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
-        "아비만 뉴스봇 자동 발송 메시지입니다."
+        "아비만 뉴스봇 자동 발송 시지입니다."
     )
 
 
@@ -848,8 +826,7 @@ def main() -> None:
     )
     safe_print(
         f"      [경쟁사] raw {c.get('raw', 0)} -> 업체필터 {c.get('company_filtered', 0)} -> "
-        f"grouped {c.get('grouped', 0)} -> fresh {c.get('fresh', 0)} -> "
-        f"similar {c.get('similar', 0)} -> final {c.get('final', 0)}"
+        f"grouped {c.get('grouped', 0)} -> fresh {c.get('fresh', 0)} -> final {c.get('final', 0)}"
     )
 
     if total == 0:
