@@ -95,7 +95,7 @@ COMPETITOR_QUERIES: list[str] = [
     "WITTMANN robot",
     "TOPSTAR robot",
 ]
-COMPETITOR_MIN_SIMILARITY = 0.18
+COMPETITOR_MIN_SIMILARITY = 0.1
 
 # 오래된 기사 차단 강화
 # 플라스틱·사출: 0~2일
