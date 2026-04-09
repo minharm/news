@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -58,6 +59,9 @@ KAKAO_REFRESH_TOKEN = (os.getenv("KAKAO_REFRESH_TOKEN") or "").strip()
 REQUEST_TIMEOUT_NEWS = 10
 REQUEST_TIMEOUT_CLAUDE = 30
 REQUEST_TIMEOUT_KAKAO = 10
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 0.8
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 PLACEHOLDER_HINTS = [
     "입력", "여기에", "example", "sample", "replace",
@@ -129,6 +133,30 @@ def validate_startup_env() -> None:
     validate_header_env("KAKAO_ACCESS_TOKEN", KAKAO_ACCESS_TOKEN, required=False)
     validate_header_env("KAKAO_REFRESH_TOKEN", KAKAO_REFRESH_TOKEN, required=False)
     validate_header_env("KAKAO_REST_API_KEY", KAKAO_REST_API_KEY, required=False)
+
+
+def request_with_retry(method: str, url: str, **kwargs: Any) -> requests.Response:
+    last_exc: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code not in RETRY_STATUS_CODES:
+                return resp
+            if attempt == MAX_RETRIES:
+                return resp
+            safe_print(f"[재시도] {method.upper()} {url} -> {resp.status_code} ({attempt}/{MAX_RETRIES})")
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == MAX_RETRIES:
+                break
+            safe_print(f"[재시도] {method.upper()} {url} 요청 예외: {exc} ({attempt}/{MAX_RETRIES})")
+
+        time.sleep(RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{method.upper()} {url} 요청 실패")
 
 
 def strip_html(text: str) -> str:
@@ -259,7 +287,7 @@ def search_naver_news(query: str, display: int = 5) -> list[dict[str, str]]:
     }
     params = {"query": query, "display": display, "sort": "date"}
 
-    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_NEWS)
+    resp = request_with_retry("GET", url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_NEWS)
     resp.raise_for_status()
 
     items = resp.json().get("items", [])
@@ -276,7 +304,6 @@ def search_naver_news(query: str, display: int = 5) -> list[dict[str, str]]:
     return results
 
 
-# 중복 기사 묶기 강화
 def group_similar_articles(articles: list[dict[str, str]], category: str) -> list[dict[str, str]]:
     groups: list[list[dict[str, str]]] = []
 
@@ -363,7 +390,6 @@ def save_history(today_records: list[dict[str, str]]) -> None:
         safe_print(f"[경고] 발송 이력 저장 실패: {e}")
 
 
-# 최근 발송 이력 중복 기준 강화
 def is_recent_duplicate(article: dict[str, str], recent_history: list[dict[str, str]]) -> bool:
     title = article.get("title", "")
     link = article.get("link", "")
@@ -407,7 +433,6 @@ def get_recent_history(days: int = 3) -> list[dict[str, str]]:
     return [x for x in history if x.get("date", "") >= cutoff]
 
 
-# 오늘 수집분끼리도 중복 차단
 def filter_recent_duplicates(articles: list[dict[str, str]]) -> list[dict[str, str]]:
     recent = get_recent_history(days=3)
     kept: list[dict[str, str]] = []
@@ -612,7 +637,8 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
 - 마크다운 굵게(**)는 사용하지 말 것
 '''
 
-    response = requests.post(
+    response = request_with_retry(
+        "POST",
         "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key": ANTHROPIC_API_KEY,
@@ -647,7 +673,7 @@ def build_no_news_message() -> str:
         f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
         "안녕하세요.\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
-        "아비만 뉴스봇 자동 발송 메시지입니다."
+        "아비만 뉴스봇 자동 발송 시지입니다."
     )
 
 
@@ -672,7 +698,7 @@ def send_kakao_message(text: str) -> bool:
     }
     data = {"template_object": json.dumps(template, ensure_ascii=False)}
 
-    resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+    resp = request_with_retry("POST", url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
     if resp.status_code == 200:
         safe_print("카카오톡 전송 성공!")
         return True
@@ -695,7 +721,7 @@ def refresh_kakao_token() -> str | None:
         "refresh_token": refresh_token,
     }
 
-    resp = requests.post(url, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+    resp = request_with_retry("POST", url, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
     resp.raise_for_status()
 
     result = resp.json()
@@ -712,6 +738,7 @@ def refresh_kakao_token() -> str | None:
 
 
 def _update_env(key: str, value: str) -> None:
+    temp_path = ENV_PATH.with_name(f"{ENV_PATH.name}.tmp")
     try:
         lines: list[str] = []
         if ENV_PATH.exists():
@@ -719,7 +746,7 @@ def _update_env(key: str, value: str) -> None:
                 lines = f.readlines()
 
         found = False
-        with open(ENV_PATH, "w", encoding="utf-8") as f:
+        with open(temp_path, "w", encoding="utf-8") as f:
             for line in lines:
                 if line.startswith(f"{key}="):
                     f.write(f"{key}={value}\n")
@@ -728,7 +755,14 @@ def _update_env(key: str, value: str) -> None:
                     f.write(line)
             if not found:
                 f.write(f"{key}={value}\n")
+
+        os.replace(temp_path, ENV_PATH)
     except Exception as e:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
         safe_print(f"[경고] .env 업데이트 실패: {e}")
 
 
