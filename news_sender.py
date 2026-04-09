@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -60,6 +61,9 @@ REQUEST_TIMEOUT_NEWS = 10
 REQUEST_TIMEOUT_CLAUDE = 30
 REQUEST_TIMEOUT_KAKAO = 10
 REQUEST_TIMEOUT_ARTICLE = 10
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 0.8
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 PLACEHOLDER_HINTS = [
     "입력", "여기에", "example", "sample", "replace",
@@ -82,6 +86,13 @@ COMPANY_KEYWORDS: list[str] = [
     "WITTMANN",
     "TOPSTAR",
 ]
+
+EN_COMPANY_PATTERNS = [
+    (kw, re.compile(rf"\b{re.escape(kw.lower())}\b"))
+    for kw in COMPANY_KEYWORDS
+    if not re.search(r"[가-힣]", kw)
+]
+KO_COMPANY_KEYWORDS = [kw for kw in COMPANY_KEYWORDS if re.search(r"[가-힣]", kw)]
 
 COMPETITOR_QUERIES: list[str] = [
     "유일로보틱스",
@@ -184,10 +195,48 @@ def token_similarity(title_a: str, title_b: str) -> float:
 
 def extract_matched_company(text: str) -> str:
     text_lower = text.lower()
-    for kw in COMPANY_KEYWORDS:
+    for kw, pattern in EN_COMPANY_PATTERNS:
+        # 영문 키워드는 단어 경계 기준으로 매칭해 오탐을 줄인다.
+        if pattern.search(text_lower):
+            return kw
+
+    for kw in KO_COMPANY_KEYWORDS:
+        # 한글 키워드는 공백 경계가 애매할 수 있어 포함 매칭을 유지한다.
         if kw.lower() in text_lower:
             return kw
     return ""
+
+
+def request_with_retry(method: str, url: str, **kwargs: Any) -> requests.Response:
+    last_exc: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code not in RETRY_STATUS_CODES:
+                return resp
+
+            if attempt == MAX_RETRIES:
+                return resp
+
+            safe_print(
+                f"[재시도] {method.upper()} {url} -> {resp.status_code}, "
+                f"{attempt}/{MAX_RETRIES}회 재시도"
+            )
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == MAX_RETRIES:
+                break
+            safe_print(
+                f"[재시도] {method.upper()} {url} 요청 예외: {exc} "
+                f"({attempt}/{MAX_RETRIES})"
+            )
+
+        time.sleep(RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{method.upper()} {url} 요청이 실패했습니다.")
 
 
 def is_valid_competitor_article(article: dict[str, str]) -> bool:
@@ -276,7 +325,13 @@ def search_naver_news(query: str, display: int = 5) -> list[dict[str, str]]:
     }
     params = {"query": query, "display": display, "sort": "date"}
 
-    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_NEWS)
+    resp = request_with_retry(
+        "GET",
+        url,
+        headers=headers,
+        params=params,
+        timeout=REQUEST_TIMEOUT_NEWS,
+    )
     resp.raise_for_status()
 
     items = resp.json().get("items", [])
@@ -609,7 +664,8 @@ def fetch_article_image(url: str, category: str) -> str:
         return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
 
     try:
-        resp = requests.get(
+        resp = request_with_retry(
+            "GET",
             url,
             headers=ARTICLE_HEADERS,
             timeout=REQUEST_TIMEOUT_ARTICLE,
@@ -626,8 +682,8 @@ def fetch_article_image(url: str, category: str) -> str:
         image_url = extract_meta_image(html, resp.url)
         if image_url:
             return image_url
-    except Exception:
-        pass
+    except Exception as e:
+        safe_print(f"[경고] 기사 이미지 수집 실패: {trim_text(url, 80)} - {e}")
 
     return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
 
@@ -675,7 +731,8 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
 """
 
     try:
-        response = requests.post(
+        response = request_with_retry(
+            "POST",
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": ANTHROPIC_API_KEY,
@@ -803,7 +860,13 @@ def send_kakao_default_template(template_object: dict[str, Any]) -> bool:
     }
     data = {"template_object": json.dumps(template_object, ensure_ascii=False)}
 
-    resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+    resp = request_with_retry(
+        "POST",
+        url,
+        headers=headers,
+        data=data,
+        timeout=REQUEST_TIMEOUT_KAKAO,
+    )
 
     safe_print(f"[카카오 응답] status={resp.status_code}")
     safe_print(f"[카카오 응답 본문] {resp.text}")
@@ -853,7 +916,7 @@ def refresh_kakao_token() -> str | None:
         "refresh_token": refresh_token,
     }
 
-    resp = requests.post(url, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+    resp = request_with_retry("POST", url, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
     resp.raise_for_status()
 
     result = resp.json()
@@ -870,6 +933,7 @@ def refresh_kakao_token() -> str | None:
 
 
 def _update_env(key: str, value: str) -> None:
+    temp_path = ENV_PATH.with_name(f"{ENV_PATH.name}.tmp")
     try:
         lines: list[str] = []
         if ENV_PATH.exists():
@@ -877,7 +941,7 @@ def _update_env(key: str, value: str) -> None:
                 lines = f.readlines()
 
         found = False
-        with open(ENV_PATH, "w", encoding="utf-8") as f:
+        with open(temp_path, "w", encoding="utf-8") as f:
             for line in lines:
                 if line.startswith(f"{key}="):
                     f.write(f"{key}={value}\n")
@@ -886,7 +950,13 @@ def _update_env(key: str, value: str) -> None:
                     f.write(line)
             if not found:
                 f.write(f"{key}={value}\n")
+        os.replace(temp_path, ENV_PATH)
     except Exception as e:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
         safe_print(f"[경고] .env 업데이트 실패: {e}")
 
 
