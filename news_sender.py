@@ -103,8 +103,6 @@ DEFAULT_SECTION_IMAGES = {
     "경쟁사": "https://developers.kakao.com/static/images/pc/default.png",
 }
 
-# 카카오 링크는 등록된 도메인(minharm.github.io)으로 먼저 들어간 뒤 실제 목적지로 즉시 이동시킨다.
-# news-redirect.html 파일이 GitHub Pages에 있어야 한다.
 REDIRECT_BASE_URL = "https://minharm.github.io/news-redirect.html?url="
 
 ARTICLE_HEADERS = {
@@ -145,7 +143,7 @@ def validate_startup_env() -> None:
     validate_header_env("NAVER_CLIENT_SECRET", NAVER_CLIENT_SECRET)
     validate_header_env("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
     validate_header_env("KAKAO_ACCESS_TOKEN", KAKAO_ACCESS_TOKEN, required=False)
-    validate_header_env("KAKAO__TOKEN", KAKAO_REFRESH_TOKEN, required=False)
+    validate_header_env("KAKAO_REFRESH_TOKEN", KAKAO_REFRESH_TOKEN, required=False)
     validate_header_env("KAKAO_REST_API_KEY", KAKAO_REST_API_KEY, required=False)
     validate_header_env("KAKAO_CLIENT_SECRET", KAKAO_CLIENT_SECRET, required=False)
 
@@ -577,8 +575,6 @@ def build_link(url: str) -> dict[str, str]:
 
 
 def build_homepage_link() -> dict[str, str]:
-    # 인트로 버튼도 반드시 redirect 페이지를 거치도록 통일
-    # 그래야 카카오에서 등록 도메인 외부 링크 처리 시 minharm.github.io 루트로 빠지는 문제를 줄일 수 있다.
     return build_link(DEFAULT_HEADER_LINK)
 
 
@@ -795,8 +791,7 @@ def build_feed_template(category: str, article: dict[str, str]) -> dict[str, Any
 
 def send_kakao_default_template(template_object: dict[str, Any]) -> bool:
     if not KAKAO_ACCESS_TOKEN:
-        safe_print("KAKAO_ACCESS_TOKEN 이 없어 카카오톡 전송을 할 수 없습니다.")
-        return False
+        raise RuntimeError("KAKAO_ACCESS_TOKEN 이 없어 카카오톡 전송을 할 수 없습니다.")
 
     url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
     headers = {
@@ -810,10 +805,10 @@ def send_kakao_default_template(template_object: dict[str, Any]) -> bool:
     safe_print(f"[카카오 응답] status={resp.status_code}")
     safe_print(f"[카카오 응답 본문] {resp.text}")
 
-    if resp.status_code == 200:
-        return True
+    if resp.status_code != 200:
+        raise RuntimeError(f"카카오 메시지 전송 실패: status={resp.status_code}, body={resp.text}")
 
-    return False
+    return True
 
 
 def send_intro_message(summary_text: str) -> bool:
@@ -841,34 +836,44 @@ def send_section_message(category: str, articles: list[dict[str, str]]) -> bool:
     return send_kakao_default_template(template)
 
 
-def refresh_kakao_token() -> str | None:
+def refresh_kakao_token() -> tuple[str, str | None]:
     refresh_token = KAKAO_REFRESH_TOKEN
     client_id = KAKAO_REST_API_KEY
+    client_secret = KAKAO_CLIENT_SECRET
 
-    if not refresh_token or not client_id:
-        return None
+    if not refresh_token:
+        raise ValueError("KAKAO_REFRESH_TOKEN 값이 없습니다.")
+    if not client_id:
+        raise ValueError("KAKAO_REST_API_KEY 값이 없습니다.")
+    if not client_secret:
+        raise ValueError("KAKAO_CLIENT_SECRET 값이 없습니다.")
 
     url = "https://kauth.kakao.com/oauth/token"
     data = {
         "grant_type": "refresh_token",
         "client_id": client_id,
         "refresh_token": refresh_token,
+        "client_secret": client_secret,
     }
 
     resp = requests.post(url, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+    safe_print(f"[카카오 토큰 갱신 응답] status={resp.status_code}")
+    safe_print(f"[카카오 토큰 갱신 응답 본문] {resp.text}")
     resp.raise_for_status()
 
     result = resp.json()
-    new_token = result.get("access_token")
-    if not new_token:
+    new_access_token = result.get("access_token")
+    new_refresh_token = result.get("refresh_token")
+
+    if not new_access_token:
         raise ValueError(f"카카오 토큰 갱신 응답에 access_token 이 없습니다: {result}")
 
-    _update_env("KAKAO_ACCESS_TOKEN", new_token)
-    if result.get("refresh_token"):
-        _update_env("KAKAO_REFRESH_TOKEN", result["refresh_token"])
+    _update_env("KAKAO_ACCESS_TOKEN", new_access_token)
+    if new_refresh_token:
+        _update_env("KAKAO_REFRESH_TOKEN", new_refresh_token)
 
     safe_print("카카오 토큰 갱신 완료")
-    return new_token
+    return new_access_token, new_refresh_token
 
 
 def _update_env(key: str, value: str) -> None:
@@ -917,22 +922,15 @@ def main() -> None:
     safe_print(f"  뉴스봇 실행: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
     safe_print("=" * 50 + "\n")
 
-    try:
-        validate_startup_env()
-    except Exception as e:
-        safe_print(f"환경변수 검증 실패: {e}")
-        return
+    validate_startup_env()
 
-    try:
-        new_token = refresh_kakao_token()
-        if new_token:
-            os.environ["KAKAO_ACCESS_TOKEN"] = new_token
-            KAKAO_ACCESS_TOKEN = new_token
-            refreshed_refresh = (os.getenv("KAKAO_REFRESH_TOKEN") or "").strip()
-            if refreshed_refresh:
-                KAKAO_REFRESH_TOKEN = refreshed_refresh
-    except Exception as e:
-        safe_print(f"[경고] 카카오 토큰 갱신 실패: {e}")
+    new_access_token, new_refresh_token = refresh_kakao_token()
+    os.environ["KAKAO_ACCESS_TOKEN"] = new_access_token
+    KAKAO_ACCESS_TOKEN = new_access_token
+
+    if new_refresh_token:
+        os.environ["KAKAO_REFRESH_TOKEN"] = new_refresh_token
+        KAKAO_REFRESH_TOKEN = new_refresh_token
 
     safe_print("뉴스 수집 중...")
     news_data, stats = collect_all_news()
@@ -957,14 +955,13 @@ def main() -> None:
 
     if total == 0:
         safe_print("수집 기준에 맞는 신규 뉴스가 없어 안내 메시지를 전송합니다.")
-        ok = send_kakao_default_template({
+        send_kakao_default_template({
             "object_type": "text",
             "text": build_no_news_message(),
             "link": build_homepage_link(),
             "button_title": "확인",
         })
-        if ok:
-            safe_print("카카오톡 전송 성공!")
+        safe_print("카카오톡 전송 성공!")
         return
 
     safe_print("기사 이미지 수집 중...")
@@ -974,25 +971,17 @@ def main() -> None:
     intro_summary = summarize_with_claude(news_data)
 
     safe_print("카카오톡 전송 중...")
-    success = True
 
-    if not send_intro_message(intro_summary):
-        success = False
-        safe_print("[오류] 인트로 메시지 전송 실패")
+    send_intro_message(intro_summary)
 
     if plastic_count > 0:
-        if not send_section_message("플라스틱_사출", news_data["플라스틱_사출"]):
-            success = False
-            safe_print("[오류] 플라스틱·사출 업계 메시지 전송 실패")
+        send_section_message("플라스틱_사출", news_data["플라스틱_사출"])
 
     if competitor_count > 0:
-        if not send_section_message("경쟁사", news_data["경쟁사"]):
-            success = False
-            safe_print("[오류] 취출기 경쟁사 메시지 전송 실패")
+        send_section_message("경쟁사", news_data["경쟁사"])
 
-    if success:
-        save_history(build_today_history_records(news_data))
-        safe_print("카카오톡 전송 성공!")
+    save_history(build_today_history_records(news_data))
+    safe_print("카카오톡 전송 성공!")
 
 
 if __name__ == "__main__":
