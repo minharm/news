@@ -144,8 +144,8 @@ def validate_startup_env() -> None:
     validate_header_env("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
     validate_header_env("KAKAO_ACCESS_TOKEN", KAKAO_ACCESS_TOKEN, required=False)
     validate_header_env("KAKAO_REFRESH_TOKEN", KAKAO_REFRESH_TOKEN, required=False)
-    validate_header_env("KAKAO_REST_API_KEY", KAKAO_REST_API_KEY, required=False)
-    validate_header_env("KAKAO_CLIENT_SECRET", KAKAO_CLIENT_SECRET, required=False)
+    validate_header_env("KAKAO_REST_API_KEY", KAKAO_REST_API_KEY)
+    validate_header_env("KAKAO_CLIENT_SECRET", KAKAO_CLIENT_SECRET)
 
 
 def strip_html(text: str) -> str:
@@ -971,7 +971,6 @@ def main() -> None:
     intro_summary = summarize_with_claude(news_data)
 
     safe_print("카카오톡 전송 중...")
-
     send_intro_message(intro_summary)
 
     if plastic_count > 0:
