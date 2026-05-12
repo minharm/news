@@ -55,6 +55,7 @@ ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
 KAKAO_REST_API_KEY = (os.getenv("KAKAO_REST_API_KEY") or "").strip()
 KAKAO_ACCESS_TOKEN = (os.getenv("KAKAO_ACCESS_TOKEN") or "").strip()
 KAKAO_REFRESH_TOKEN = (os.getenv("KAKAO_REFRESH_TOKEN") or "").strip()
+KAKAO_CLIENT_SECRET = (os.getenv("KAKAO_CLIENT_SECRET") or "").strip()
 
 REQUEST_TIMEOUT_NEWS = 10
 REQUEST_TIMEOUT_CLAUDE = 30
@@ -144,8 +145,9 @@ def validate_startup_env() -> None:
     validate_header_env("NAVER_CLIENT_SECRET", NAVER_CLIENT_SECRET)
     validate_header_env("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
     validate_header_env("KAKAO_ACCESS_TOKEN", KAKAO_ACCESS_TOKEN, required=False)
-    validate_header_env("KAKAO_REFRESH_TOKEN", KAKAO_REFRESH_TOKEN, required=False)
+    validate_header_env("KAKAO__TOKEN", KAKAO_REFRESH_TOKEN, required=False)
     validate_header_env("KAKAO_REST_API_KEY", KAKAO_REST_API_KEY, required=False)
+    validate_header_env("KAKAO_CLIENT_SECRET", KAKAO_CLIENT_SECRET, required=False)
 
 
 def strip_html(text: str) -> str:
