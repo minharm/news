@@ -93,6 +93,31 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+
+def get_list_config(data: dict[str, Any], key: str, default: list[str]) -> list[str]:
+    value = data.get(key, default)
+    if not isinstance(value, list):
+        safe_print(f"[경고] {key} 설정이 리스트가 아니어서 기본값을 사용합니다.")
+        return list(default)
+    result = [str(x).strip() for x in value if str(x).strip()]
+    return result or list(default)
+
+
+def get_dict_config(data: dict[str, Any], key: str, default: dict[str, int]) -> dict[str, int]:
+    value = data.get(key, default)
+    if not isinstance(value, dict):
+        safe_print(f"[경고] {key} 설정이 객체가 아니어서 기본값을 사용합니다.")
+        return dict(default)
+
+    result: dict[str, int] = {}
+    for k, v in value.items():
+        try:
+            result[str(k)] = max(int(v), 0)
+        except Exception:
+            safe_print(f"[경고] {key}.{k} 값이 숫자가 아니어서 제외합니다.")
+    return result or dict(default)
+
+
 class NewsArticle(TypedDict, total=False):
     title: str
     description: str
@@ -128,12 +153,12 @@ class AppConfig:
                 data = dict(DEFAULT_CONFIG)
 
         return cls(
-            plastic_queries=list(data.get("plastic_queries", DEFAULT_CONFIG["plastic_queries"])),
-            competitor_queries=list(data.get("competitor_queries", DEFAULT_CONFIG["competitor_queries"])),
-            company_keywords=list(data.get("company_keywords", DEFAULT_CONFIG["company_keywords"])),
-            category_limits=dict(data.get("category_limits", DEFAULT_CONFIG["category_limits"])),
-            category_max_age_days=dict(data.get("category_max_age_days", DEFAULT_CONFIG["category_max_age_days"])),
-            stock_exclude_keywords=list(data.get("stock_exclude_keywords", DEFAULT_CONFIG["stock_exclude_keywords"])),
+            plastic_queries=get_list_config(data, "plastic_queries", DEFAULT_CONFIG["plastic_queries"]),
+            competitor_queries=get_list_config(data, "competitor_queries", DEFAULT_CONFIG["competitor_queries"]),
+            company_keywords=get_list_config(data, "company_keywords", DEFAULT_CONFIG["company_keywords"]),
+            category_limits=get_dict_config(data, "category_limits", DEFAULT_CONFIG["category_limits"]),
+            category_max_age_days=get_dict_config(data, "category_max_age_days", DEFAULT_CONFIG["category_max_age_days"]),
+            stock_exclude_keywords=get_list_config(data, "stock_exclude_keywords", DEFAULT_CONFIG["stock_exclude_keywords"]),
             claude_model=(os.getenv("CLAUDE_MODEL") or data.get("claude_model") or DEFAULT_CLAUDE_MODEL).strip(),
         )
 
@@ -246,6 +271,14 @@ def validate_startup_env(state: AppState) -> None:
     validate_header_env("KAKAO_REFRESH_TOKEN", state.kakao_refresh_token, required=False)
     validate_header_env("KAKAO_REST_API_KEY", state.kakao_rest_api_key, required=False)
     validate_kakao_env(state)
+
+
+def validate_config(config: AppConfig) -> None:
+    if not config.plastic_queries and not config.competitor_queries:
+        raise ValueError("검색 쿼리가 모두 비어 있습니다. config.json을 확인하세요.")
+
+    if not config.company_keywords:
+        raise ValueError("company_keywords가 비어 있습니다. 경쟁사 필터가 정상 동작하지 않습니다.")
 
 
 def strip_html(text: str) -> str:
@@ -687,10 +720,13 @@ def build_competitor_no_news_block(text: str) -> str:
 
 
 def emphasize_title_line(text: str) -> str:
+    # Kakao text template does not reliably render true bold for plain text messages.
+    # Use visual emphasis instead.
     lines = text.splitlines()
     if lines:
         first = lines[0].strip()
-        if first and not first.startswith("【"):
+        if first:
+            first = first.strip("【】")
             lines[0] = f"【{first}】"
     return "\n".join(lines)
 
@@ -1005,9 +1041,10 @@ def main() -> None:
 
     try:
         validate_startup_env(state)
+        validate_config(state.config)
     except Exception as e:
-        safe_print(f"환경변수 검증 실패: {e}")
-        append_failed_run(state, "startup_env_failed", {"error": str(e)})
+        safe_print(f"초기 설정 검증 실패: {e}")
+        append_failed_run(state, "startup_validation_failed", {"error": str(e)})
         return
 
     try:
