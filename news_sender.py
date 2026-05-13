@@ -216,6 +216,20 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
+def is_friday_kst() -> bool:
+    return now_kst().weekday() == 4
+
+
+def circled_number(n: int) -> str:
+    nums = {1: "①", 2: "②", 3: "③", 4: "④", 5: "⑤", 6: "⑥", 7: "⑦", 8: "⑧", 9: "⑨", 10: "⑩"}
+    return nums.get(n, f"{n}.")
+
+
+def is_priority_article(article: NewsArticle) -> bool:
+    text = normalize_text(f"{article.get('title', '')} {article.get('description', '')}")
+    return any(keyword in text for keyword in ["수주", "출시", "계약"])
+
+
 def safe_print(*args: object, sep: str = " ", end: str = "\n") -> None:
     text = sep.join("" if a is None else str(a) for a in args) + end
     try:
@@ -789,7 +803,7 @@ def collect_all_news(state: AppState) -> tuple[dict[str, list[NewsArticle]], dic
 def build_competitor_no_news_block(text: str) -> str:
     if "취출기 경쟁사" in text and "신규 소식 없음" in text:
         return text
-    block = f"\n\n{SECTION_LINE}\n취출기 경쟁사\n{SECTION_LINE}\n신규 소식 없음"
+    block = f"\n\n{SECTION_LINE}\n🤖 취출기 경쟁사 (0건)\n{SECTION_LINE}\n신규 소식 없음"
     if FINAL_SIGNATURE in text:
         return text.replace(FINAL_SIGNATURE, block + f"\n\n{FINAL_SIGNATURE}")
     return text + block
@@ -811,8 +825,10 @@ def validate_newsletter_text(text: str, competitor_has_news: bool) -> str:
     cleaned = text.strip()
     cleaned = cleaned.replace("**", "")
 
+    # normalize link formats
+    cleaned = re.sub(r"기사 원문\s*→\s*(https?://\S+)", r"기사 원문 → \1", cleaned)
     if "기사 원문" not in cleaned and "http" in cleaned:
-        cleaned = re.sub(r"\n(https?://\S+)", r"\n기사 원문\n\1", cleaned)
+        cleaned = re.sub(r"\n(https?://\S+)", r"\n기사 원문 → \1", cleaned)
 
     title_pattern = r"^【?\d{4}년 \d{2}월 \d{2}일 \| 오늘의 뉴스 브리핑 📰】?"
     if not re.match(title_pattern, cleaned):
@@ -839,6 +855,18 @@ def validate_newsletter_text(text: str, competitor_has_news: bool) -> str:
         if not cleaned.endswith(FINAL_SIGNATURE):
             cleaned = cleaned.rstrip() + f"\n\n{FINAL_SIGNATURE}"
 
+    if not competitor_has_news and ("취출기 경쟁사" not in cleaned or "신규 소식 없음" not in cleaned):
+        cleaned = build_competitor_no_news_block(cleaned)
+
+    if len(cleaned) > MAX_NEWSLETTER_LENGTH:
+        fixed_tail = f"\n\n{SECTION_LINE}\n🤖 취출기 경쟁사 (0건)\n{SECTION_LINE}\n신규 소식 없음\n\n{FINAL_SIGNATURE}" if not competitor_has_news else f"\n\n{FINAL_SIGNATURE}"
+        body_limit = MAX_NEWSLETTER_LENGTH - len(fixed_tail)
+        if body_limit <= 0:
+            raise ValueError("고정 영역 때문에 뉴스레터 길이를 맞출 수 없습니다.")
+        head = cleaned.split(FINAL_SIGNATURE)[0].strip()
+        head = head[:body_limit].rstrip()
+        cleaned = head + fixed_tail
+
     if len(cleaned) > MAX_NEWSLETTER_LENGTH:
         raise ValueError("뉴스레터 길이가 1,100자를 초과했습니다.")
     if FINAL_SIGNATURE not in cleaned:
@@ -847,13 +875,17 @@ def validate_newsletter_text(text: str, competitor_has_news: bool) -> str:
         raise ValueError("마크다운 굵게가 제거되지 않았습니다.")
     if "기사 원문" not in cleaned:
         raise ValueError("기사 원문 형식이 없습니다.")
-    if not re.search(r"기사 원문\s*\nhttps?://\S+", cleaned):
-        raise ValueError("기사 원문 아래 실제 링크가 없습니다.")
+
+    link_pattern = r"기사 원문\s*→\s*https?://\S+"
+    if not re.search(link_pattern, cleaned):
+        raise ValueError("기사 원문 링크 형식이 없습니다.")
 
     article_source_count = len(re.findall(r"기사 원문", cleaned))
-    url_count = len(re.findall(r"기사 원문\s*\nhttps?://\S+", cleaned))
+    url_count = len(re.findall(link_pattern, cleaned))
+    if article_source_count == 0:
+        raise ValueError("기사 원문이 없습니다.")
     if article_source_count != url_count:
-        raise ValueError("일부 기사 원문 아래 링크가 누락되었습니다.")
+        raise ValueError("일부 기사 원문 링크가 누락되었습니다.")
 
     return emphasize_title_line(cleaned)
 
@@ -884,7 +916,7 @@ def source_keyword_tokens(article: NewsArticle) -> set[str]:
 
 def validate_newsletter_against_source(text: str, news_data: dict[str, list[NewsArticle]]) -> str:
     source_urls = extract_source_urls(news_data)
-    used_urls = re.findall(r"기사 원문\s*\n(https?://\S+)", text)
+    used_urls = re.findall(r"기사 원문\s*→\s*(https?://\S+)", text)
 
     for url in used_urls:
         if url not in source_urls:
@@ -912,6 +944,7 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
         raise ValueError("요약할 뉴스가 없습니다.")
 
     label_map = {"플라스틱_사출": "플라스틱·사출 업계", "경쟁사": "취출기 경쟁사"}
+    emoji_map = {"플라스틱_사출": "🏭", "경쟁사": "🤖"}
     news_text_parts: list[str] = []
     category_counts: dict[str, int] = {}
 
@@ -922,19 +955,23 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
         if not articles:
             continue
 
-        news_text_parts.append(f"\n[{label}]")
-        for article in articles:
+        news_text_parts.append(f"\n[{emoji_map[category]} {label} / {len(articles)}건]")
+        for idx, article in enumerate(articles, 1):
             group_note = ""
             if article.get("_group_size", 1) > 1:
                 group_note = f" (유사 기사 {article.get('_group_size', 1)}건 묶음)"
+            priority_hint = "[★] " if is_priority_article(article) else ""
             news_text_parts.append(
-                f"- 제목: {article['title']}{group_note}\n"
+                f"- 번호: {circled_number(idx)}\n"
+                f"  중요도힌트: {priority_hint.strip() or '일반'}\n"
+                f"  제목: {article['title']}{group_note}\n"
                 f"  내용: {article['description']}\n"
                 f"  링크: {article['link']}"
             )
 
     news_text = "\n".join(news_text_parts)
     today = now_kst().strftime("%Y년 %m월 %d일")
+    friday_mode = is_friday_kst()
 
     competitor_guide = (
         "취출기 경쟁사 뉴스가 한 건도 없으면 해당 섹션 대신 '신규 소식 없음'만 출력하세요."
@@ -942,7 +979,13 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
         else "취출기 경쟁사 섹션은 실제 수집된 기사만 포함하세요."
     )
 
-    prompt = f'''오늘({today}) 뉴스를 카카오톡 메시지용 깔끔한 뉴스레터 형식으로 정리해 주세요.
+    weekly_review_rule = (
+        '- 오늘이 금요일이므로 인사말 아래에 "주간 총평: ..." 형식으로 이번 주 흐름을 한 줄 추가하세요.'
+        if friday_mode
+        else "- 금요일이 아니면 주간 총평 줄은 넣지 마세요."
+    )
+
+    prompt = f"""오늘({today}) 뉴스를 카카오톡 메시지용 깔끔한 뉴스레터 형식으로 정리해 주세요.
 
 [원본 뉴스]
 {news_text}
@@ -954,12 +997,13 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
 [작성 규칙]
 - 전체 톤은 정돈된 비즈니스 뉴스레터 스타일로 작성
 - 과한 이모지, 과장 표현, 불필요한 감탄 표현은 사용 금지
-- 이모지는 제목 줄의 신문 아이콘 1개만 허용
+- 허용 이모지는 제목 줄의 신문 아이콘 1개, 섹션용 🏭/🤖만 허용
 - 맨 위 제목은 반드시 다음 형식으로 작성:
   "{today} | 오늘의 뉴스 브리핑 📰"
-- 제목 아래에는 아래 형식으로 인사말 2줄을 작성
+- 제목 아래에는 아래 형식으로 인사말을 작성
   1줄: "안녕하세요."
   2줄: 오늘 전체 뉴스 흐름을 요약하는 한 줄 코멘트
+  {weekly_review_rule}
 
 - 섹션 순서는 반드시:
   1. 플라스틱·사출 업계
@@ -968,23 +1012,26 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
 - 각 섹션은 실제 수집된 뉴스가 있을 때만 출력
 - {competitor_guide}
 
-- 각 섹션 제목은 반드시 아래처럼 구분선을 포함해 작성:
+- 각 섹션 제목은 반드시 아래 형식으로 작성:
 {SECTION_LINE}
-플라스틱·사출 업계
-{SECTION_LINE}
-
-{SECTION_LINE}
-취출기 경쟁사
+🏭 플라스틱·사출 업계 ({category_counts.get("플라스틱_사출", 0)}건)
 {SECTION_LINE}
 
+{SECTION_LINE}
+🤖 취출기 경쟁사 ({category_counts.get("경쟁사", 0)}건)
+{SECTION_LINE}
+
+- 각 뉴스 번호는 반드시 ① ② ③ 형식의 동그라미 숫자를 사용할 것
 - 각 뉴스는 반드시 아래 형식으로 작성:
-  1) 짧은 제목
-  - 핵심 내용 한 줄 요약
-  기사 원문
-  링크주소
+  ① [★] 짧은 제목
+  ㄴ 핵심 내용 한 줄 요약
+  기사 원문 → 실제링크
 
-- "링크", "원문 링크", "URL" 같은 표현 대신 반드시 "기사 원문" 이라고만 작성
-- "기사 원문" 다음 줄에 실제 링크 주소를 그대로 넣을 것
+- 중요도 표시 규칙:
+  - 기사 내용에 수주, 출시, 계약 성격이 있으면 제목 앞에 [★]를 붙일 것
+  - 해당하지 않으면 [★]를 붙이지 말 것
+
+- "링크", "원문 링크", "URL" 같은 표현 대신 반드시 "기사 원문 → 실제링크" 형식으로 한 줄에 작성
 - 기사 제목을 길게 그대로 복붙하지 말고, 16~26자 내외의 짧은 제목으로 정리
 - 핵심 내용은 1문장으로만 작성
 - 유사 기사 묶음이라고 표시된 경우, 묶인 기사의 공통 핵심 이슈로 자연스럽게 요약
@@ -993,7 +1040,7 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
 - 전체 길이는 1,100자 이내
 - 마지막 문구는 반드시: "{FINAL_SIGNATURE}"
 - 마크다운 굵게(**)는 사용하지 말 것
-'''
+"""
 
     response = request_with_retry(
         "POST",
@@ -1018,11 +1065,11 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
         raise ValueError(f"Claude 응답 형식이 예상과 다릅니다: {data}")
 
     first = content[0]
-    text = first.get("text") if isinstance(first, dict) else None
-    if not text:
+    result_text = first.get("text") if isinstance(first, dict) else None
+    if not result_text:
         raise ValueError(f"Claude 응답 본문이 비어 있습니다: {data}")
 
-    validated = validate_newsletter_text(text, competitor_has_news=category_counts.get("경쟁사", 0) > 0)
+    validated = validate_newsletter_text(result_text, competitor_has_news=category_counts.get("경쟁사", 0) > 0)
     return validate_newsletter_against_source(validated, news_data)
 
 
@@ -1033,7 +1080,7 @@ def build_no_news_message() -> str:
         "안녕하세요.\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
         f"{SECTION_LINE}\n"
-        "취출기 경쟁사\n"
+        "🤖 취출기 경쟁사 (0건)\n"
         f"{SECTION_LINE}\n"
         "신규 소식 없음\n\n"
         f"{FINAL_SIGNATURE}"
