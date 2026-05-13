@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 from zoneinfo import ZoneInfo
 
 import requests
@@ -17,6 +17,7 @@ from dotenv import load_dotenv, set_key
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 HISTORY_PATH = BASE_DIR / "sent_news_history.json"
+CONFIG_PATH = BASE_DIR / "config.json"
 
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
@@ -26,18 +27,20 @@ REQUEST_TIMEOUT_NEWS = 10
 REQUEST_TIMEOUT_CLAUDE = 30
 REQUEST_TIMEOUT_KAKAO = 10
 MAX_NEWS_SEARCH_FAILURES = 3
+MAX_NEWSLETTER_LENGTH = 1100
+FINAL_SIGNATURE = "아비만 뉴스봇 자동 발송 메시지입니다."
 
 PLACEHOLDER_HINTS = [
     "입력", "여기에", "example", "sample", "replace",
     "발급", "api key", "client id", "secret", "token",
 ]
 
-STOPWORDS = {
+DEFAULT_STOPWORDS = {
     "기사", "단독", "속보", "관련", "위해", "통해", "대한", "오늘", "오전", "오후",
     "발표", "공시", "시장", "업계", "뉴스", "로봇", "robot", "news", "the", "and"
 }
 
-COMPANY_KEYWORDS: list[str] = [
+DEFAULT_COMPANY_KEYWORDS = [
     "유일로보틱스",
     "나우로보틱스",
     "YUSHIN",
@@ -49,27 +52,77 @@ COMPANY_KEYWORDS: list[str] = [
     "TOPSTAR",
 ]
 
-PLASTIC_QUERIES: list[str] = [
-    "플라스틱 산업 동향",
-    "사출성형 업계",
-    "플라스틱 원자재 가격",
-]
+DEFAULT_CONFIG = {
+    "plastic_queries": [
+        "플라스틱 산업 동향",
+        "사출성형 업계",
+        "플라스틱 원자재 가격",
+    ],
+    "competitor_queries": [
+        "유일로보틱스",
+        "나우로보틱스",
+        "YUSHIN 취출기",
+        "휴먼텍 로봇",
+        "한양로보틱스",
+        "SEPRO robot",
+        "WITTMANN robot",
+        "TOPSTAR robot",
+    ],
+    "company_keywords": DEFAULT_COMPANY_KEYWORDS,
+    "category_limits": {
+        "플라스틱_사출": 3,
+        "경쟁사": 3,
+    },
+    "category_max_age_days": {
+        "플라스틱_사출": 2,
+        "경쟁사": 1,
+    },
+    "stock_exclude_keywords": [
+        "주가", "상승", "하락", "급등", "급락", "상한가", "하한가", "매수", "매도",
+        "투자주의", "투자경고", "시총", "시가총액", "증권", "리포트", "목표주가",
+        "per", "pbr", "eps", "코스피", "코스닥", "공모가", "차트", "수급",
+        "기관 순매수", "외국인 순매수", "주식", "종목", "테마주",
+    ],
+}
 
-COMPETITOR_QUERIES: list[str] = [
-    "유일로보틱스",
-    "나우로보틱스",
-    "YUSHIN 취출기",
-    "휴먼텍 로봇",
-    "한양로보틱스",
-    "SEPRO robot",
-    "WITTMANN robot",
-    "TOPSTAR robot",
-]
 
-# 오래된 기사 차단 강화
-# 플라스틱·사출: 0~2일
-# 경쟁사: 0~1일
-CATEGORY_MAX_AGE_DAYS = {"플라스틱_사출": 2, "경쟁사": 1}
+class NewsArticle(TypedDict, total=False):
+    title: str
+    description: str
+    link: str
+    pubDate: str
+    _group_size: int
+
+
+@dataclass
+class AppConfig:
+    plastic_queries: list[str]
+    competitor_queries: list[str]
+    company_keywords: list[str]
+    category_limits: dict[str, int]
+    category_max_age_days: dict[str, int]
+    stock_exclude_keywords: list[str]
+
+    @classmethod
+    def load(cls, path: Path) -> "AppConfig":
+        if not path.exists():
+            path.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
+            data = DEFAULT_CONFIG
+        else:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = DEFAULT_CONFIG
+
+        merged = {
+            "plastic_queries": data.get("plastic_queries", DEFAULT_CONFIG["plastic_queries"]),
+            "competitor_queries": data.get("competitor_queries", DEFAULT_CONFIG["competitor_queries"]),
+            "company_keywords": data.get("company_keywords", DEFAULT_CONFIG["company_keywords"]),
+            "category_limits": data.get("category_limits", DEFAULT_CONFIG["category_limits"]),
+            "category_max_age_days": data.get("category_max_age_days", DEFAULT_CONFIG["category_max_age_days"]),
+            "stock_exclude_keywords": data.get("stock_exclude_keywords", DEFAULT_CONFIG["stock_exclude_keywords"]),
+        }
+        return cls(**merged)
 
 
 @dataclass
@@ -80,9 +133,10 @@ class AppState:
     kakao_rest_api_key: str
     kakao_access_token: str
     kakao_refresh_token: str
-    kakao_client_secret: str = ""
+    kakao_client_secret: str
     env_path: Path = ENV_PATH
     history_path: Path = HISTORY_PATH
+    config: AppConfig = field(default_factory=lambda: AppConfig.load(CONFIG_PATH))
 
 
 @dataclass
@@ -186,7 +240,7 @@ def tokenize_title(text: str) -> list[str]:
     for tok in normalized.split():
         if len(tok) <= 1:
             continue
-        if tok in STOPWORDS:
+        if tok in DEFAULT_STOPWORDS:
             continue
         tokens.append(tok)
     return tokens
@@ -200,25 +254,32 @@ def token_similarity(title_a: str, title_b: str) -> float:
     return len(a & b) / max(len(a | b), 1)
 
 
-def extract_matched_company(text: str) -> str:
+def extract_matched_company(text: str, config: AppConfig) -> str:
     text_lower = text.lower()
-    for kw in COMPANY_KEYWORDS:
+    for kw in config.company_keywords:
         if kw.lower() in text_lower:
             return kw
     return ""
 
 
-def is_valid_competitor_article(article: dict[str, str]) -> bool:
-    title = article.get("title", "")
-    desc = article.get("description", "")
-    combined = f"{title} {desc}"
-    matched = extract_matched_company(combined)
-    return bool(matched)
+def is_stock_related_article(article: NewsArticle, config: AppConfig) -> bool:
+    combined = normalize_text(f"{article.get('title', '')} {article.get('description', '')}")
+    return any(keyword.lower() in combined for keyword in config.stock_exclude_keywords)
 
 
-def build_fingerprint(article: dict[str, str]) -> str:
+def is_valid_competitor_article(article: NewsArticle, config: AppConfig) -> bool:
+    combined = f"{article.get('title', '')} {article.get('description', '')}"
+    matched = extract_matched_company(combined, config)
+    if not matched:
+        return False
+    if is_stock_related_article(article, config):
+        return False
+    return True
+
+
+def build_fingerprint(article: NewsArticle, config: AppConfig) -> str:
     title = article.get("title", "")
-    company = extract_matched_company(title)
+    company = extract_matched_company(title, config)
     tokens = tokenize_title(title)
     key_tokens = tokens[:6]
     return f"{company}|{' '.join(key_tokens)}".strip("|")
@@ -236,7 +297,7 @@ def parse_pubdate(pub_date: str) -> datetime | None:
         return None
 
 
-def get_article_age_days(article: dict[str, str]) -> int | None:
+def get_article_age_days(article: NewsArticle) -> int | None:
     dt = parse_pubdate(article.get("pubDate", ""))
     if dt is None:
         return None
@@ -244,15 +305,15 @@ def get_article_age_days(article: dict[str, str]) -> int | None:
     return max(delta.days, 0)
 
 
-def is_fresh_enough(article: dict[str, str], category: str) -> bool:
+def is_fresh_enough(article: NewsArticle, category: str, config: AppConfig) -> bool:
     age_days = get_article_age_days(article)
-    max_days = CATEGORY_MAX_AGE_DAYS.get(category, 2)
+    max_days = config.category_max_age_days.get(category, 2)
     if age_days is None:
         return False
     return age_days <= max_days
 
 
-def article_score(article: dict[str, str], category: str) -> int:
+def article_score(article: NewsArticle, category: str, config: AppConfig) -> int:
     title = normalize_text(article.get("title", ""))
     desc = normalize_text(article.get("description", ""))
     text = f"{title} {desc}"
@@ -260,7 +321,7 @@ def article_score(article: dict[str, str], category: str) -> int:
     score = 0
     priority_keywords = [
         "신제품", "출시", "수주", "투자", "증설", "실적", "계약", "전시", "자동화",
-        "공장", "합작", "공급", "원료", "가격", "상승", "하락", "친환경", "성형"
+        "공장", "합작", "공급", "원료", "가격", "친환경", "성형", "설비", "공정",
     ]
 
     for kw in priority_keywords:
@@ -271,7 +332,7 @@ def article_score(article: dict[str, str], category: str) -> int:
         score += 1
     if len(article.get("description", "")) >= 40:
         score += 1
-    if extract_matched_company(article.get("title", "")):
+    if extract_matched_company(article.get("title", ""), config):
         score += 2
 
     age_days = get_article_age_days(article)
@@ -286,7 +347,7 @@ def article_score(article: dict[str, str], category: str) -> int:
     return score
 
 
-def search_naver_news(query: str, state: AppState, display: int = 5) -> list[dict[str, str]]:
+def search_naver_news(query: str, state: AppState, display: int = 5) -> list[NewsArticle]:
     url = "https://openapi.naver.com/v1/search/news.json"
     headers = {
         "X-Naver-Client-Id": state.naver_client_id,
@@ -298,33 +359,35 @@ def search_naver_news(query: str, state: AppState, display: int = 5) -> list[dic
     resp.raise_for_status()
 
     items = resp.json().get("items", [])
-    results: list[dict[str, str]] = []
+    results: list[NewsArticle] = []
 
     for item in items:
-        results.append({
+        article: NewsArticle = {
             "title": strip_html(item.get("title", "")),
             "description": strip_html(item.get("description", "")),
             "link": item.get("originallink") or item.get("link") or "",
             "pubDate": item.get("pubDate", ""),
-        })
+            "_group_size": 1,
+        }
+        results.append(article)
 
     return results
 
 
-def group_similar_articles(articles: list[dict[str, str]], category: str) -> list[dict[str, str]]:
-    groups: list[list[dict[str, str]]] = []
+def group_similar_articles(articles: list[NewsArticle], category: str, config: AppConfig) -> list[NewsArticle]:
+    groups: list[list[NewsArticle]] = []
 
     for article in articles:
         title = article.get("title", "")
-        company = extract_matched_company(title)
-        fp = build_fingerprint(article)
+        company = extract_matched_company(title, config)
+        fp = build_fingerprint(article, config)
         matched = False
 
         for group in groups:
             rep = group[0]
             rep_title = rep.get("title", "")
-            rep_company = extract_matched_company(rep_title)
-            rep_fp = build_fingerprint(rep)
+            rep_company = extract_matched_company(rep_title, config)
+            rep_fp = build_fingerprint(rep, config)
             sim = token_similarity(title, rep_title)
             same_company = bool(company and rep_company and company == rep_company)
 
@@ -346,25 +409,25 @@ def group_similar_articles(articles: list[dict[str, str]], category: str) -> lis
         if not matched:
             groups.append([article])
 
-    selected: list[dict[str, str]] = []
+    selected: list[NewsArticle] = []
     for group in groups:
         ranked = sorted(
             group,
             key=lambda x: (
-                article_score(x, category),
+                article_score(x, category, config),
                 len(x.get("description", "")),
                 len(x.get("title", "")),
             ),
             reverse=True,
         )
         chosen = dict(ranked[0])
-        chosen["_group_size"] = str(len(group))
+        chosen["_group_size"] = len(group)
         selected.append(chosen)
 
     selected.sort(
         key=lambda x: (
-            article_score(x, category),
-            int(x.get("_group_size", "1")),
+            article_score(x, category, config),
+            x.get("_group_size", 1),
             len(x.get("description", "")),
         ),
         reverse=True,
@@ -372,7 +435,7 @@ def group_similar_articles(articles: list[dict[str, str]], category: str) -> lis
     return selected
 
 
-def load_history(state: AppState) -> list[dict[str, str]]:
+def load_history(state: AppState) -> list[dict[str, Any]]:
     if not state.history_path.exists():
         return []
     try:
@@ -385,23 +448,29 @@ def load_history(state: AppState) -> list[dict[str, str]]:
         return []
 
 
-def save_history(state: AppState, today_records: list[dict[str, str]]) -> None:
+def atomic_write_json(path: Path, data: Any) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def save_history(state: AppState, today_records: list[dict[str, Any]]) -> None:
     history = load_history(state)
     history.extend(today_records)
     cutoff = (now_kst() - timedelta(days=14)).strftime("%Y-%m-%d")
     trimmed = [x for x in history if x.get("date", "") >= cutoff]
     try:
-        with open(state.history_path, "w", encoding="utf-8") as f:
-            json.dump(trimmed, f, ensure_ascii=False, indent=2)
+        atomic_write_json(state.history_path, trimmed)
     except Exception as e:
         safe_print(f"[경고] 발송 이력 저장 실패: {e}")
 
 
-def is_recent_duplicate(article: dict[str, str], recent_history: list[dict[str, str]]) -> bool:
+def is_recent_duplicate(article: NewsArticle, recent_history: list[dict[str, Any]], config: AppConfig) -> bool:
     title = article.get("title", "")
     link = article.get("link", "")
-    fp = build_fingerprint(article)
-    company = extract_matched_company(title)
+    fp = build_fingerprint(article, config)
+    company = extract_matched_company(title, config)
     pub_dt = parse_pubdate(article.get("pubDate", ""))
 
     for hist in recent_history:
@@ -434,28 +503,31 @@ def is_recent_duplicate(article: dict[str, str], recent_history: list[dict[str, 
     return False
 
 
-def get_recent_history(state: AppState, days: int = 3) -> list[dict[str, str]]:
+def get_recent_history(state: AppState, days: int = 3) -> list[dict[str, Any]]:
     history = load_history(state)
     cutoff = (now_kst() - timedelta(days=days)).strftime("%Y-%m-%d")
     return [x for x in history if x.get("date", "") >= cutoff]
 
 
-def filter_recent_duplicates(articles: list[dict[str, str]], state: AppState) -> list[dict[str, str]]:
-    recent = get_recent_history(state, days=3)
-    kept: list[dict[str, str]] = []
+def filter_recent_duplicates(
+    articles: list[NewsArticle],
+    recent_history: list[dict[str, Any]],
+    config: AppConfig,
+) -> list[NewsArticle]:
+    kept: list[NewsArticle] = []
 
     for article in articles:
-        if is_recent_duplicate(article, recent):
+        if is_recent_duplicate(article, recent_history, config):
             continue
 
         duplicate_inside_kept = False
         for saved in kept:
             sim = token_similarity(article.get("title", ""), saved.get("title", ""))
-            current_company = extract_matched_company(article.get("title", ""))
-            saved_company = extract_matched_company(saved.get("title", ""))
+            current_company = extract_matched_company(article.get("title", ""), config)
+            saved_company = extract_matched_company(saved.get("title", ""), config)
             same_company = bool(current_company and current_company == saved_company)
 
-            if build_fingerprint(article) == build_fingerprint(saved):
+            if build_fingerprint(article, config) == build_fingerprint(saved, config):
                 duplicate_inside_kept = True
                 break
             if sim >= 0.65:
@@ -471,8 +543,8 @@ def filter_recent_duplicates(articles: list[dict[str, str]], state: AppState) ->
     return kept
 
 
-def _dedupe_articles(articles: list[dict[str, str]]) -> list[dict[str, str]]:
-    deduped: list[dict[str, str]] = []
+def _dedupe_articles(articles: list[NewsArticle]) -> list[NewsArticle]:
+    deduped: list[NewsArticle] = []
     seen_keys: set[str] = set()
 
     for article in articles:
@@ -492,9 +564,10 @@ def _collect_category(
     limit: int,
     state: AppState,
     health: SearchHealth,
-    article_filter: Callable[[dict[str, str]], bool] | None = None,
-) -> tuple[list[dict[str, str]], dict[str, int]]:
-    raw_articles: list[dict[str, str]] = []
+    recent_history: list[dict[str, Any]],
+    article_filter: Callable[[NewsArticle, AppConfig], bool] | None = None,
+) -> tuple[list[NewsArticle], dict[str, int]]:
+    raw_articles: list[NewsArticle] = []
 
     for query in queries:
         try:
@@ -505,21 +578,21 @@ def _collect_category(
 
     deduped_articles = _dedupe_articles(raw_articles)
 
-    filtered_articles = deduped_articles
-    filtered_out_count = 0
-    if article_filter is not None:
-        filtered_articles = [a for a in deduped_articles if article_filter(a)]
-        filtered_out_count = len(deduped_articles) - len(filtered_articles)
-        if filtered_out_count > 0:
-            safe_print(f"   [{category} 필터] 관련없는 기사 {filtered_out_count}건 차단됨")
+    filtered_articles = []
+    for article in deduped_articles:
+        if is_stock_related_article(article, state.config):
+            continue
+        if article_filter is not None and not article_filter(article, state.config):
+            continue
+        filtered_articles.append(article)
 
-    grouped_articles = group_similar_articles(filtered_articles, category)
-    fresh_articles = [a for a in grouped_articles if is_fresh_enough(a, category)]
-    final_articles = filter_recent_duplicates(fresh_articles, state)
+    grouped_articles = group_similar_articles(filtered_articles, category, state.config)
+    fresh_articles = [a for a in grouped_articles if is_fresh_enough(a, category, state.config)]
+    final_articles = filter_recent_duplicates(fresh_articles, recent_history, state.config)
     final_articles.sort(
         key=lambda x: (
-            article_score(x, category),
-            int(x.get("_group_size", "1")),
+            article_score(x, category, state.config),
+            x.get("_group_size", 1),
             len(x.get("description", "")),
         ),
         reverse=True,
@@ -537,39 +610,35 @@ def _collect_category(
     return final_articles[:limit], stats
 
 
-def collect_all_news(state: AppState) -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[str, int]]]:
-    category_limits = {"플라스틱_사출": 3, "경쟁사": 3}
-    collected: dict[str, list[dict[str, str]]] = {}
+def collect_all_news(state: AppState) -> tuple[dict[str, list[NewsArticle]], dict[str, dict[str, int]], SearchHealth]:
+    collected: dict[str, list[NewsArticle]] = {}
     stats: dict[str, dict[str, int]] = {}
     health = SearchHealth()
+    recent_history = get_recent_history(state, days=3)
 
     collected["플라스틱_사출"], stats["플라스틱_사출"] = _collect_category(
-        queries=PLASTIC_QUERIES,
+        queries=state.config.plastic_queries,
         category="플라스틱_사출",
-        limit=category_limits["플라스틱_사출"],
+        limit=state.config.category_limits.get("플라스틱_사출", 3),
         state=state,
         health=health,
+        recent_history=recent_history,
     )
 
     collected["경쟁사"], stats["경쟁사"] = _collect_category(
-        queries=COMPETITOR_QUERIES,
+        queries=state.config.competitor_queries,
         category="경쟁사",
-        limit=category_limits["경쟁사"],
+        limit=state.config.category_limits.get("경쟁사", 3),
         state=state,
         health=health,
+        recent_history=recent_history,
         article_filter=is_valid_competitor_article,
     )
 
-    if health.failures >= MAX_NEWS_SEARCH_FAILURES:
-        raise RuntimeError(
-            f"네이버 API 실패가 {health.failures}건 발생했습니다. "
-            + " | ".join(health.messages[:5])
-        )
-
-    return collected, stats
+    return collected, stats, health
 
 
-def summarize_with_claude(news_data: dict[str, list[dict[str, str]]], state: AppState) -> str:
+def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppState) -> str:
     total_count = sum(len(v) for v in news_data.values())
     if total_count == 0:
         raise ValueError("요약할 뉴스가 없습니다.")
@@ -589,8 +658,8 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]], state: App
         news_text_parts.append(f"\n[{label}]")
         for article in articles:
             group_note = ""
-            if int(article.get("_group_size", "1")) > 1:
-                group_note = f" (유사 기사 {article.get('_group_size')}건 묶음)"
+            if article.get("_group_size", 1) > 1:
+                group_note = f" (유사 기사 {article.get('_group_size', 1)}건 묶음)"
             news_text_parts.append(
                 f"- 제목: {article['title']}{group_note}\n"
                 f"  내용: {article['description']}\n"
@@ -655,7 +724,7 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]], state: App
 - 원본 뉴스에 없는 사실은 절대 추가하지 말 것
 - 각 카테고리는 수집된 기사만 기준으로 최대 3건 출력
 - 전체 길이는 1,100자 이내
-- 마지막 문구는 반드시: "아비만 뉴스봇 자동 발송 메시지입니다."
+- 마지막 문구는 반드시: "{FINAL_SIGNATURE}"
 - 마크다운 굵게(**)는 사용하지 말 것
 '''
 
@@ -685,7 +754,30 @@ def summarize_with_claude(news_data: dict[str, list[dict[str, str]]], state: App
     if not text:
         raise ValueError(f"Claude 응답 본문이 비어 있습니다: {data}")
 
-    return text
+    return validate_newsletter_text(text)
+
+
+def validate_newsletter_text(text: str) -> str:
+    cleaned = text.strip()
+
+    if "기사 원문" not in cleaned and "http" in cleaned:
+        cleaned = re.sub(r"\n(https?://\S+)", r"\n기사 원문\n\1", cleaned)
+
+    if not cleaned.endswith(FINAL_SIGNATURE):
+        cleaned = cleaned.rstrip() + f"\n\n{FINAL_SIGNATURE}"
+
+    if len(cleaned) > MAX_NEWSLETTER_LENGTH:
+        reserve = len(FINAL_SIGNATURE) + 2
+        cleaned = cleaned[: MAX_NEWSLETTER_LENGTH - reserve].rstrip()
+        cleaned = cleaned + f"\n\n{FINAL_SIGNATURE}"
+
+    if "기사 원문" not in cleaned:
+        raise ValueError("Claude 결과에 '기사 원문' 형식이 없습니다.")
+
+    if FINAL_SIGNATURE not in cleaned:
+        raise ValueError("Claude 결과에 마지막 문구가 없습니다.")
+
+    return cleaned
 
 
 def build_no_news_message() -> str:
@@ -694,18 +786,28 @@ def build_no_news_message() -> str:
         f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
         "안녕하세요.\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
-        "아비만 뉴스봇 자동 발송 메시지입니다."
+        f"{FINAL_SIGNATURE}"
     )
 
 
-def send_kakao_message(text: str, state: AppState) -> bool:
-    if not state.kakao_access_token:
-        safe_print("KAKAO_ACCESS_TOKEN 이 없어 카카오톡 전송을 할 수 없습니다.")
-        return False
+def build_failure_message(reason: str) -> str:
+    today = now_kst().strftime("%Y년 %m월 %d일")
+    return (
+        f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
+        "안녕하세요.\n"
+        "오늘은 뉴스 수집 중 오류가 발생해 브리핑을 생성하지 못했습니다.\n\n"
+        f"오류 요약: {reason}\n\n"
+        f"{FINAL_SIGNATURE}"
+    )
+
+
+def _send_kakao_message_once(text: str, access_token: str) -> tuple[bool, int, str]:
+    if not access_token:
+        return False, 0, "KAKAO_ACCESS_TOKEN 이 없습니다."
 
     url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
     headers = {
-        "Authorization": f"Bearer {state.kakao_access_token}",
+        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
     template = {
@@ -720,11 +822,31 @@ def send_kakao_message(text: str, state: AppState) -> bool:
     data = {"template_object": json.dumps(template, ensure_ascii=False)}
 
     resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
-    if resp.status_code == 200:
+    return resp.status_code == 200, resp.status_code, resp.text
+
+
+def send_kakao_message(text: str, state: AppState) -> bool:
+    ok, status, body = _send_kakao_message_once(text, state.kakao_access_token)
+
+    if ok:
         safe_print("카카오톡 전송 성공!")
         return True
 
-    safe_print(f"카카오톡 전송 실패: {resp.status_code} - {resp.text}")
+    safe_print(f"카카오톡 전송 실패: {status} - {body}")
+
+    if status == 401:
+        safe_print("[경고] 401 발생. 토큰 재갱신 후 1회 재전송 시도")
+        try:
+            refreshed = refresh_kakao_token(state)
+            if refreshed:
+                ok2, status2, body2 = _send_kakao_message_once(text, state.kakao_access_token)
+                if ok2:
+                    safe_print("카카오톡 재전송 성공!")
+                    return True
+                safe_print(f"카카오톡 재전송 실패: {status2} - {body2}")
+        except Exception as e:
+            safe_print(f"[경고] 재갱신/재전송 실패: {e}")
+
     return False
 
 
@@ -755,10 +877,9 @@ def refresh_kakao_token(state: AppState) -> str | None:
     _update_env("KAKAO_ACCESS_TOKEN", new_token, state)
     state.kakao_access_token = new_token
 
-    new_refresh_token = result.get("refresh_token")
-    if new_refresh_token:
-        _update_env("KAKAO_REFRESH_TOKEN", new_refresh_token, state)
-        state.kakao_refresh_token = new_refresh_token
+    if result.get("refresh_token"):
+        _update_env("KAKAO_REFRESH_TOKEN", result["refresh_token"], state)
+        state.kakao_refresh_token = result["refresh_token"]
 
     safe_print("카카오 토큰 갱신 완료")
     return new_token
@@ -771,9 +892,9 @@ def _update_env(key: str, value: str, state: AppState) -> None:
         safe_print(f"[경고] .env 업데이트 실패: {e}")
 
 
-def build_today_history_records(news_data: dict[str, list[dict[str, str]]]) -> list[dict[str, str]]:
+def build_today_history_records(news_data: dict[str, list[NewsArticle]], state: AppState) -> list[dict[str, Any]]:
     today = now_kst().strftime("%Y-%m-%d")
-    records: list[dict[str, str]] = []
+    records: list[dict[str, Any]] = []
 
     for category, articles in news_data.items():
         for article in articles:
@@ -782,8 +903,8 @@ def build_today_history_records(news_data: dict[str, list[dict[str, str]]]) -> l
                 "category": category,
                 "title": article.get("title", ""),
                 "link": article.get("link", ""),
-                "fingerprint": build_fingerprint(article),
-                "company": extract_matched_company(article.get("title", "")),
+                "fingerprint": build_fingerprint(article, state.config),
+                "company": extract_matched_company(article.get("title", ""), state.config),
             })
 
     return records
@@ -809,9 +930,10 @@ def main() -> None:
 
     safe_print("뉴스 수집 중...")
     try:
-        news_data, stats = collect_all_news(state)
+        news_data, stats, health = collect_all_news(state)
     except Exception as e:
         safe_print(f"[오류] 뉴스 수집 실패: {e}")
+        send_kakao_message(build_failure_message(str(e)), state)
         return
 
     plastic_count = len(news_data.get("플라스틱_사출", []))
@@ -833,8 +955,12 @@ def main() -> None:
     )
 
     if total == 0:
-        safe_print("수집 기준에 맞는 신규 뉴스가 없어 안내 메시지를 전송합니다.")
-        send_kakao_message(build_no_news_message(), state)
+        if health.failures > 0:
+            safe_print("검색 실패가 있었고 최종 뉴스가 0건이라 수집 실패 메시지를 전송합니다.")
+            send_kakao_message(build_failure_message("검색 실패 후 최종 뉴스 0건"), state)
+        else:
+            safe_print("수집 기준에 맞는 신규 뉴스가 없어 안내 메시지를 전송합니다.")
+            send_kakao_message(build_no_news_message(), state)
         return
 
     safe_print("Claude AI로 요약 중...")
@@ -842,13 +968,14 @@ def main() -> None:
         message = summarize_with_claude(news_data, state)
     except Exception as e:
         safe_print(f"Claude 요약 실패: {e}")
+        send_kakao_message(build_failure_message(f"요약 실패: {e}"), state)
         return
 
     safe_print(f"요약 완료 ({len(message)}자)")
     safe_print("카카오톡 전송 중...")
     ok = send_kakao_message(message, state)
     if ok:
-        save_history(state, build_today_history_records(news_data))
+        save_history(state, build_today_history_records(news_data, state))
 
 
 if __name__ == "__main__":
