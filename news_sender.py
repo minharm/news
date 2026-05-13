@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from html import unescape
 from pathlib import Path
 from typing import Any, Callable, TypedDict
 from zoneinfo import ZoneInfo
@@ -226,6 +227,17 @@ def validate_header_env(name: str, value: str | None, *, required: bool = True) 
         raise ValueError(f"환경변수 {name} 값에 한글 또는 비ASCII 문자가 포함되어 있습니다: {stripped!r}") from exc
 
 
+def validate_kakao_env(state: AppState) -> None:
+    has_access = bool(state.kakao_access_token)
+    can_refresh = bool(state.kakao_refresh_token and state.kakao_rest_api_key)
+
+    if not has_access and not can_refresh:
+        raise ValueError(
+            "카카오 발송을 위해 KAKAO_ACCESS_TOKEN 또는 "
+            "KAKAO_REFRESH_TOKEN + KAKAO_REST_API_KEY 가 필요합니다."
+        )
+
+
 def validate_startup_env(state: AppState) -> None:
     validate_header_env("NAVER_CLIENT_ID", state.naver_client_id)
     validate_header_env("NAVER_CLIENT_SECRET", state.naver_client_secret)
@@ -233,6 +245,7 @@ def validate_startup_env(state: AppState) -> None:
     validate_header_env("KAKAO_ACCESS_TOKEN", state.kakao_access_token, required=False)
     validate_header_env("KAKAO_REFRESH_TOKEN", state.kakao_refresh_token, required=False)
     validate_header_env("KAKAO_REST_API_KEY", state.kakao_rest_api_key, required=False)
+    validate_kakao_env(state)
 
 
 def strip_html(text: str) -> str:
@@ -620,6 +633,11 @@ def evaluate_search_health(state: AppState, health: SearchHealth) -> str | None:
     if health.category_failures.get("플라스틱_사출", 0) >= len(state.config.plastic_queries):
         return "플라스틱/사출 뉴스 검색 전체 실패"
 
+    competitor_failures = health.category_failures.get("경쟁사", 0)
+    competitor_total = len(state.config.competitor_queries)
+    if competitor_total > 0 and competitor_failures >= competitor_total:
+        return "취출기 경쟁사 뉴스 검색 전체 실패"
+
     return None
 
 
@@ -651,12 +669,21 @@ def collect_all_news(state: AppState) -> tuple[dict[str, list[NewsArticle]], dic
 
 
 def build_competitor_no_news_block(text: str) -> str:
-    if "취출기 경쟁사" in text:
+    if "취출기 경쟁사" in text and "신규 소식 없음" in text:
         return text
     block = f"\n\n{SECTION_LINE}\n취출기 경쟁사\n{SECTION_LINE}\n신규 소식 없음"
     if FINAL_SIGNATURE in text:
         return text.replace(FINAL_SIGNATURE, block + f"\n\n{FINAL_SIGNATURE}")
     return text + block
+
+
+def emphasize_title_line(text: str) -> str:
+    lines = text.splitlines()
+    if lines:
+        first = lines[0].strip()
+        if first and not first.startswith("【"):
+            lines[0] = f"【{first}】"
+    return "\n".join(lines)
 
 
 def validate_newsletter_text(text: str, competitor_has_news: bool) -> str:
@@ -700,6 +727,11 @@ def validate_newsletter_text(text: str, competitor_has_news: bool) -> str:
         raise ValueError("기사 원문 형식이 없습니다.")
     if not re.search(r"기사 원문\s*\nhttps?://\S+", cleaned):
         raise ValueError("기사 원문 아래 실제 링크가 없습니다.")
+
+    article_source_count = len(re.findall(r"기사 원문", cleaned))
+    url_count = len(re.findall(r"기사 원문\s*\nhttps?://\S+", cleaned))
+    if article_source_count != url_count:
+        raise ValueError("일부 기사 원문 아래 링크가 누락되었습니다.")
 
     return cleaned
 
@@ -825,7 +857,7 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
 def build_no_news_message() -> str:
     today = now_kst().strftime("%Y년 %m월 %d일")
     return (
-        f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
+        f"【{today} | 오늘의 뉴스 브리핑 📰】\n\n"
         "안녕하세요.\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
         f"{SECTION_LINE}\n"
@@ -839,7 +871,7 @@ def build_no_news_message() -> str:
 def build_failure_message(reason: str) -> str:
     today = now_kst().strftime("%Y년 %m월 %d일")
     return (
-        f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
+        f"【{today} | 오늘의 뉴스 브리핑 📰】\n\n"
         "안녕하세요.\n"
         "오늘은 뉴스 수집 중 오류가 발생해 브리핑을 생성하지 못했습니다.\n\n"
         f"오류 요약: {reason}\n\n"
