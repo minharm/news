@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import sys
@@ -18,6 +17,7 @@ from dotenv import load_dotenv, set_key
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 HISTORY_PATH = BASE_DIR / "sent_news_history.json"
+FAILED_RUNS_PATH = BASE_DIR / "failed_runs.json"
 CONFIG_PATH = BASE_DIR / "config.json"
 
 load_dotenv(dotenv_path=ENV_PATH, override=True)
@@ -27,16 +27,20 @@ KST = ZoneInfo("Asia/Seoul")
 REQUEST_TIMEOUT_NEWS = 10
 REQUEST_TIMEOUT_CLAUDE = 30
 REQUEST_TIMEOUT_KAKAO = 10
+
 MAX_NEWS_SEARCH_FAILURES = 3
+MAX_NEWS_SEARCH_FAILURE_RATIO = 0.4
 MAX_NEWSLETTER_LENGTH = 1100
 FINAL_SIGNATURE = "아비만 뉴스봇 자동 발송 메시지입니다."
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-20250514"
+SECTION_LINE = "━━━━━━━━━━"
 
 PLACEHOLDER_HINTS = [
     "입력", "여기에", "example", "sample", "replace",
     "발급", "api key", "client id", "secret", "token",
 ]
 
-DEFAULT_STOPWORDS = {
+STOPWORDS = {
     "기사", "단독", "속보", "관련", "위해", "통해", "대한", "오늘", "오전", "오후",
     "발표", "공시", "시장", "업계", "뉴스", "로봇", "robot", "news", "the", "and"
 }
@@ -53,11 +57,11 @@ DEFAULT_COMPANY_KEYWORDS = [
     "TOPSTAR",
 ]
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "plastic_queries": [
         "플라스틱 산업 동향",
         "사출성형 업계",
-        "플라스틱 원자재 가격"
+        "플라스틱 원자재 가격",
     ],
     "competitor_queries": [
         "유일로보틱스",
@@ -67,21 +71,23 @@ DEFAULT_CONFIG = {
         "한양로보틱스",
         "SEPRO robot",
         "WITTMANN robot",
-        "TOPSTAR robot"
+        "TOPSTAR robot",
     ],
     "company_keywords": DEFAULT_COMPANY_KEYWORDS,
     "category_limits": {
         "플라스틱_사출": 3,
-        "경쟁사": 3
+        "경쟁사": 3,
     },
     "category_max_age_days": {
         "플라스틱_사출": 2,
-        "경쟁사": 1
+        "경쟁사": 1,
     },
     "stock_exclude_keywords": [
-        "주가", "급등", "급락", "상한가", "하한가", "증권", "시가총액", "시총", "공모가",
-        "목표주가", "매수", "매도", "리포트", "투자주의", "투자경고", "테마주", "종목",
-        "코스피", "코스닥", "차트", "수급", "외국인 순매수", "기관 순매수", "per", "pbr", "eps"
+        "주가", "급등", "급락", "상한가", "하한가", "매수", "매도",
+        "투자주의", "투자경고", "시총", "시가총액", "증권", "리포트", "목표주가",
+        "per", "pbr", "eps", "코스피", "코스닥", "공모가", "차트", "수급",
+        "기관 순매수", "외국인 순매수", "주식", "종목", "테마주",
+        "배당", "호재", "악재", "투자자",
     ],
 }
 
@@ -102,28 +108,33 @@ class AppConfig:
     category_limits: dict[str, int]
     category_max_age_days: dict[str, int]
     stock_exclude_keywords: list[str]
+    claude_model: str
 
     @classmethod
     def load(cls, path: Path) -> "AppConfig":
+        data: dict[str, Any]
         if not path.exists():
+            safe_print("[경고] config.json 이 없어 기본 설정 파일을 생성합니다.")
             path.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
-            data = DEFAULT_CONFIG
+            data = dict(DEFAULT_CONFIG)
         else:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("config.json 최상위가 객체가 아닙니다.")
             except Exception as e:
                 safe_print(f"[경고] config.json 로딩 실패, 기본 설정 사용: {e}")
-                data = DEFAULT_CONFIG
+                data = dict(DEFAULT_CONFIG)
 
-        merged = {
-            "plastic_queries": data.get("plastic_queries", DEFAULT_CONFIG["plastic_queries"]),
-            "competitor_queries": data.get("competitor_queries", DEFAULT_CONFIG["competitor_queries"]),
-            "company_keywords": data.get("company_keywords", DEFAULT_CONFIG["company_keywords"]),
-            "category_limits": data.get("category_limits", DEFAULT_CONFIG["category_limits"]),
-            "category_max_age_days": data.get("category_max_age_days", DEFAULT_CONFIG["category_max_age_days"]),
-            "stock_exclude_keywords": data.get("stock_exclude_keywords", DEFAULT_CONFIG["stock_exclude_keywords"]),
-        }
-        return cls(**merged)
+        return cls(
+            plastic_queries=list(data.get("plastic_queries", DEFAULT_CONFIG["plastic_queries"])),
+            competitor_queries=list(data.get("competitor_queries", DEFAULT_CONFIG["competitor_queries"])),
+            company_keywords=list(data.get("company_keywords", DEFAULT_CONFIG["company_keywords"])),
+            category_limits=dict(data.get("category_limits", DEFAULT_CONFIG["category_limits"])),
+            category_max_age_days=dict(data.get("category_max_age_days", DEFAULT_CONFIG["category_max_age_days"])),
+            stock_exclude_keywords=list(data.get("stock_exclude_keywords", DEFAULT_CONFIG["stock_exclude_keywords"])),
+            claude_model=(os.getenv("CLAUDE_MODEL") or data.get("claude_model") or DEFAULT_CLAUDE_MODEL).strip(),
+        )
 
 
 @dataclass
@@ -137,6 +148,7 @@ class AppState:
     kakao_client_secret: str
     env_path: Path = ENV_PATH
     history_path: Path = HISTORY_PATH
+    failed_runs_path: Path = FAILED_RUNS_PATH
     config: AppConfig = field(default_factory=lambda: AppConfig.load(CONFIG_PATH))
 
 
@@ -144,22 +156,12 @@ class AppState:
 class SearchHealth:
     failures: int = 0
     messages: list[str] = field(default_factory=list)
+    category_failures: dict[str, int] = field(default_factory=lambda: {"플라스틱_사출": 0, "경쟁사": 0})
 
-    def add_failure(self, query: str, exc: Exception) -> None:
+    def add_failure(self, category: str, query: str, exc: Exception) -> None:
         self.failures += 1
-        self.messages.append(f"{query}: {exc}")
-
-
-logger = logging.getLogger("news_bot")
-
-
-def setup_logging() -> None:
-    if logger.handlers:
-        return
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(handler)
+        self.category_failures[category] = self.category_failures.get(category, 0) + 1
+        self.messages.append(f"{category}:{query}: {exc}")
 
 
 def now_kst() -> datetime:
@@ -169,10 +171,14 @@ def now_kst() -> datetime:
 def safe_print(*args: object, sep: str = " ", end: str = "\n") -> None:
     text = sep.join("" if a is None else str(a) for a in args) + end
     try:
-        logger.info(text.rstrip("\n"))
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "cp949"
+        safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        sys.stdout.write(safe_text)
     except Exception:
         try:
-            sys.stdout.write(text)
+            sys.__stdout__.write(text.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
         except Exception:
             pass
 
@@ -245,14 +251,7 @@ def normalize_text(text: str) -> str:
 
 def tokenize_title(text: str) -> list[str]:
     normalized = normalize_text(text)
-    tokens = []
-    for tok in normalized.split():
-        if len(tok) <= 1:
-            continue
-        if tok in DEFAULT_STOPWORDS:
-            continue
-        tokens.append(tok)
-    return tokens
+    return [tok for tok in normalized.split() if len(tok) > 1 and tok not in STOPWORDS]
 
 
 def token_similarity(title_a: str, title_b: str) -> float:
@@ -279,11 +278,7 @@ def is_stock_related_article(article: NewsArticle, config: AppConfig) -> bool:
 def is_valid_competitor_article(article: NewsArticle, config: AppConfig) -> bool:
     combined = f"{article.get('title', '')} {article.get('description', '')}"
     matched = extract_matched_company(combined, config)
-    if not matched:
-        return False
-    if is_stock_related_article(article, config):
-        return False
-    return True
+    return bool(matched) and not is_stock_related_article(article, config)
 
 
 def build_fingerprint(article: NewsArticle, config: AppConfig) -> str:
@@ -310,16 +305,13 @@ def get_article_age_days(article: NewsArticle) -> int | None:
     dt = parse_pubdate(article.get("pubDate", ""))
     if dt is None:
         return None
-    delta = now_kst() - dt
-    return max(delta.days, 0)
+    return max((now_kst() - dt).days, 0)
 
 
 def is_fresh_enough(article: NewsArticle, category: str, config: AppConfig) -> bool:
     age_days = get_article_age_days(article)
     max_days = config.category_max_age_days.get(category, 2)
-    if age_days is None:
-        return False
-    return age_days <= max_days
+    return age_days is not None and age_days <= max_days
 
 
 def article_score(article: NewsArticle, category: str, config: AppConfig) -> int:
@@ -328,12 +320,10 @@ def article_score(article: NewsArticle, category: str, config: AppConfig) -> int
     text = f"{title} {desc}"
 
     score = 0
-    priority_keywords = [
+    for kw in [
         "신제품", "출시", "수주", "투자", "증설", "실적", "계약", "전시", "자동화",
         "공장", "합작", "공급", "원료", "가격", "친환경", "성형", "설비", "공정",
-    ]
-
-    for kw in priority_keywords:
+    ]:
         if kw in text:
             score += 2
 
@@ -369,17 +359,14 @@ def search_naver_news(query: str, state: AppState, display: int = 5) -> list[New
 
     items = resp.json().get("items", [])
     results: list[NewsArticle] = []
-
     for item in items:
-        article: NewsArticle = {
+        results.append({
             "title": strip_html(item.get("title", "")),
             "description": strip_html(item.get("description", "")),
             "link": item.get("originallink") or item.get("link") or "",
             "pubDate": item.get("pubDate", ""),
             "_group_size": 1,
-        }
-        results.append(article)
-
+        })
     return results
 
 
@@ -404,12 +391,10 @@ def group_similar_articles(articles: list[NewsArticle], category: str, config: A
                 group.append(article)
                 matched = True
                 break
-
             if sim >= 0.60:
                 group.append(article)
                 matched = True
                 break
-
             if same_company and sim >= 0.42:
                 group.append(article)
                 matched = True
@@ -444,17 +429,17 @@ def group_similar_articles(articles: list[NewsArticle], category: str, config: A
     return selected
 
 
-def load_history(state: AppState) -> list[dict[str, Any]]:
-    if not state.history_path.exists():
+def load_json_list(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
         return []
     try:
-        with open(state.history_path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             return [x for x in data if isinstance(x, dict)]
-        return []
     except Exception:
-        return []
+        pass
+    return []
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
@@ -462,6 +447,10 @@ def atomic_write_json(path: Path, data: Any) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, path)
+
+
+def load_history(state: AppState) -> list[dict[str, Any]]:
+    return load_json_list(state.history_path)
 
 
 def save_history(state: AppState, today_records: list[dict[str, Any]]) -> None:
@@ -473,6 +462,19 @@ def save_history(state: AppState, today_records: list[dict[str, Any]]) -> None:
         atomic_write_json(state.history_path, trimmed)
     except Exception as e:
         safe_print(f"[경고] 발송 이력 저장 실패: {e}")
+
+
+def append_failed_run(state: AppState, reason: str, extra: dict[str, Any] | None = None) -> None:
+    payload = {"datetime": now_kst().strftime("%Y-%m-%d %H:%M:%S"), "reason": reason}
+    if extra:
+        payload.update(extra)
+    try:
+        history = load_json_list(state.failed_runs_path)
+        history.append(payload)
+        history = history[-200:]
+        atomic_write_json(state.failed_runs_path, history)
+    except Exception as e:
+        safe_print(f"[경고] 실패 이력 저장 실패: {e}")
 
 
 def is_recent_duplicate(article: NewsArticle, recent_history: list[dict[str, Any]], config: AppConfig) -> bool:
@@ -494,10 +496,8 @@ def is_recent_duplicate(article: NewsArticle, recent_history: list[dict[str, Any
 
         if fp and hist_fp and fp == hist_fp:
             return True
-
         if sim >= 0.68:
             return True
-
         if company and hist_company and company == hist_company and sim >= 0.42:
             return True
 
@@ -508,7 +508,6 @@ def is_recent_duplicate(article: NewsArticle, recent_history: list[dict[str, Any
                     return True
             except Exception:
                 pass
-
     return False
 
 
@@ -518,11 +517,7 @@ def get_recent_history(state: AppState, days: int = 3) -> list[dict[str, Any]]:
     return [x for x in history if x.get("date", "") >= cutoff]
 
 
-def filter_recent_duplicates(
-    articles: list[NewsArticle],
-    recent_history: list[dict[str, Any]],
-    config: AppConfig,
-) -> list[NewsArticle]:
+def filter_recent_duplicates(articles: list[NewsArticle], recent_history: list[dict[str, Any]], config: AppConfig) -> list[NewsArticle]:
     kept: list[NewsArticle] = []
 
     for article in articles:
@@ -548,21 +543,18 @@ def filter_recent_duplicates(
 
         if not duplicate_inside_kept:
             kept.append(article)
-
     return kept
 
 
 def _dedupe_articles(articles: list[NewsArticle]) -> list[NewsArticle]:
     deduped: list[NewsArticle] = []
     seen_keys: set[str] = set()
-
     for article in articles:
         key = f"{article.get('title', '')}|{article.get('link', '')}"
         if key in seen_keys:
             continue
         seen_keys.add(key)
         deduped.append(article)
-
     return deduped
 
 
@@ -577,17 +569,16 @@ def _collect_category(
     article_filter: Callable[[NewsArticle, AppConfig], bool] | None = None,
 ) -> tuple[list[NewsArticle], dict[str, int]]:
     raw_articles: list[NewsArticle] = []
-
     for query in queries:
         try:
             raw_articles.extend(search_naver_news(query, state, display=3))
         except Exception as e:
-            health.add_failure(query, e)
+            health.add_failure(category, query, e)
             safe_print(f"[경고] '{query}' 검색 실패: {e}")
 
     deduped_articles = _dedupe_articles(raw_articles)
 
-    filtered_articles = []
+    filtered_articles: list[NewsArticle] = []
     for article in deduped_articles:
         if is_stock_related_article(article, state.config):
             continue
@@ -619,6 +610,19 @@ def _collect_category(
     return final_articles[:limit], stats
 
 
+def evaluate_search_health(state: AppState, health: SearchHealth) -> str | None:
+    total_queries = len(state.config.plastic_queries) + len(state.config.competitor_queries)
+    failure_ratio = health.failures / max(total_queries, 1)
+
+    if health.failures >= MAX_NEWS_SEARCH_FAILURES and failure_ratio >= MAX_NEWS_SEARCH_FAILURE_RATIO:
+        return f"뉴스 검색 실패가 기준치를 초과했습니다. ({health.failures}/{total_queries}, {failure_ratio:.0%})"
+
+    if health.category_failures.get("플라스틱_사출", 0) >= len(state.config.plastic_queries):
+        return "플라스틱/사출 뉴스 검색 전체 실패"
+
+    return None
+
+
 def collect_all_news(state: AppState) -> tuple[dict[str, list[NewsArticle]], dict[str, dict[str, int]], SearchHealth]:
     collected: dict[str, list[NewsArticle]] = {}
     stats: dict[str, dict[str, int]] = {}
@@ -643,15 +647,21 @@ def collect_all_news(state: AppState) -> tuple[dict[str, list[NewsArticle]], dic
         recent_history=recent_history,
         article_filter=is_valid_competitor_article,
     )
-
     return collected, stats, health
 
 
-def validate_newsletter_text(text: str) -> str:
-    cleaned = text.strip()
+def build_competitor_no_news_block(text: str) -> str:
+    if "취출기 경쟁사" in text:
+        return text
+    block = f"\n\n{SECTION_LINE}\n취출기 경쟁사\n{SECTION_LINE}\n신규 소식 없음"
+    if FINAL_SIGNATURE in text:
+        return text.replace(FINAL_SIGNATURE, block + f"\n\n{FINAL_SIGNATURE}")
+    return text + block
 
-    if "**" in cleaned:
-        cleaned = cleaned.replace("**", "")
+
+def validate_newsletter_text(text: str, competitor_has_news: bool) -> str:
+    cleaned = text.strip()
+    cleaned = cleaned.replace("**", "")
 
     if "기사 원문" not in cleaned and "http" in cleaned:
         cleaned = re.sub(r"\n(https?://\S+)", r"\n기사 원문\n\1", cleaned)
@@ -660,36 +670,36 @@ def validate_newsletter_text(text: str) -> str:
         today = now_kst().strftime("%Y년 %m월 %d일")
         cleaned = f"{today} | 오늘의 뉴스 브리핑 📰\n\n" + cleaned
 
+    if not competitor_has_news:
+        cleaned = build_competitor_no_news_block(cleaned)
+
     if not cleaned.endswith(FINAL_SIGNATURE):
         cleaned = cleaned.rstrip() + f"\n\n{FINAL_SIGNATURE}"
-
-    if "기사 원문" not in cleaned:
-        raise ValueError("Claude 결과에 '기사 원문' 형식이 없습니다.")
-
-    if not re.search(r"기사 원문\nhttps?://\S+", cleaned):
-        raise ValueError("Claude 결과에 '기사 원문' 아래 실제 링크가 없습니다.")
-
-    if FINAL_SIGNATURE not in cleaned:
-        raise ValueError("Claude 결과에 마지막 문구가 없습니다.")
 
     if len(cleaned) > MAX_NEWSLETTER_LENGTH:
         sections = cleaned.split("\n\n")
         rebuilt: list[str] = []
-        for block in sections:
-            candidate = "\n\n".join(rebuilt + [block]).strip()
-            if len(candidate + f"\n\n{FINAL_SIGNATURE}") > MAX_NEWSLETTER_LENGTH:
+        for section in sections:
+            candidate = "\n\n".join(rebuilt + [section]).strip()
+            if not candidate.endswith(FINAL_SIGNATURE):
+                candidate = candidate.rstrip() + f"\n\n{FINAL_SIGNATURE}"
+            if len(candidate) > MAX_NEWSLETTER_LENGTH:
                 break
-            rebuilt.append(block)
-
+            rebuilt.append(section)
         cleaned = "\n\n".join(rebuilt).strip()
         if not cleaned.endswith(FINAL_SIGNATURE):
-            if FINAL_SIGNATURE in cleaned:
-                pass
-            else:
-                cleaned = cleaned.rstrip() + f"\n\n{FINAL_SIGNATURE}"
+            cleaned = cleaned.rstrip() + f"\n\n{FINAL_SIGNATURE}"
 
     if len(cleaned) > MAX_NEWSLETTER_LENGTH:
-        raise ValueError(f"Claude 결과가 {MAX_NEWSLETTER_LENGTH}자를 초과합니다.")
+        raise ValueError("뉴스레터 길이가 1,100자를 초과했습니다.")
+    if FINAL_SIGNATURE not in cleaned:
+        raise ValueError("마지막 문구가 없습니다.")
+    if "**" in cleaned:
+        raise ValueError("마크다운 굵게가 제거되지 않았습니다.")
+    if "기사 원문" not in cleaned:
+        raise ValueError("기사 원문 형식이 없습니다.")
+    if not re.search(r"기사 원문\s*\nhttps?://\S+", cleaned):
+        raise ValueError("기사 원문 아래 실제 링크가 없습니다.")
 
     return cleaned
 
@@ -707,7 +717,6 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
         articles = news_data.get(category, [])
         label = label_map[category]
         category_counts[category] = len(articles)
-
         if not articles:
             continue
 
@@ -726,7 +735,7 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
     today = now_kst().strftime("%Y년 %m월 %d일")
 
     competitor_guide = (
-        "취출기 경쟁사 뉴스가 한 건도 없으면 해당 섹션은 아예 출력하지 마세요."
+        "취출기 경쟁사 뉴스가 한 건도 없으면 해당 섹션 대신 '신규 소식 없음'만 출력하세요."
         if category_counts.get("경쟁사", 0) == 0
         else "취출기 경쟁사 섹션은 실제 수집된 기사만 포함하세요."
     )
@@ -758,13 +767,13 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
 - {competitor_guide}
 
 - 각 섹션 제목은 반드시 아래처럼 구분선을 포함해 작성:
-━━━━━━━━━━
+{SECTION_LINE}
 플라스틱·사출 업계
-━━━━━━━━━━
+{SECTION_LINE}
 
-━━━━━━━━━━
+{SECTION_LINE}
 취출기 경쟁사
-━━━━━━━━━━
+{SECTION_LINE}
 
 - 각 뉴스는 반드시 아래 형식으로 작성:
   1) 짧은 제목
@@ -779,7 +788,7 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
 - 유사 기사 묶음이라고 표시된 경우, 묶인 기사의 공통 핵심 이슈로 자연스럽게 요약
 - 원본 뉴스에 없는 사실은 절대 추가하지 말 것
 - 각 카테고리는 수집된 기사만 기준으로 최대 3건 출력
-- 전체 길이는 {MAX_NEWSLETTER_LENGTH}자 이내
+- 전체 길이는 1,100자 이내
 - 마지막 문구는 반드시: "{FINAL_SIGNATURE}"
 - 마크다운 굵게(**)는 사용하지 말 것
 '''
@@ -792,7 +801,7 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
             "content-type": "application/json",
         },
         json={
-            "model": "claude-sonnet-4-20250514",
+            "model": state.config.claude_model,
             "max_tokens": 1500,
             "messages": [{"role": "user", "content": prompt}],
         },
@@ -810,7 +819,7 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
     if not text:
         raise ValueError(f"Claude 응답 본문이 비어 있습니다: {data}")
 
-    return validate_newsletter_text(text)
+    return validate_newsletter_text(text, competitor_has_news=category_counts.get("경쟁사", 0) > 0)
 
 
 def build_no_news_message() -> str:
@@ -819,6 +828,10 @@ def build_no_news_message() -> str:
         f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
         "안녕하세요.\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
+        f"{SECTION_LINE}\n"
+        "취출기 경쟁사\n"
+        f"{SECTION_LINE}\n"
+        "신규 소식 없음\n\n"
         f"{FINAL_SIGNATURE}"
     )
 
@@ -828,7 +841,7 @@ def build_failure_message(reason: str) -> str:
     return (
         f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
         "안녕하세요.\n"
-        "오늘은 뉴스 수집 또는 발송 과정에서 오류가 발생해 브리핑을 생성하지 못했습니다.\n\n"
+        "오늘은 뉴스 수집 중 오류가 발생해 브리핑을 생성하지 못했습니다.\n\n"
         f"오류 요약: {reason}\n\n"
         f"{FINAL_SIGNATURE}"
     )
@@ -863,6 +876,7 @@ def _send_kakao_message_once(text: str, access_token: str) -> tuple[bool, int, s
 
 def send_kakao_message(text: str, state: AppState) -> bool:
     ok, status, body = _send_kakao_message_once(text, state.kakao_access_token)
+
     if ok:
         safe_print("카카오톡 전송 성공!")
         return True
@@ -886,17 +900,14 @@ def send_kakao_message(text: str, state: AppState) -> bool:
 
 
 def refresh_kakao_token(state: AppState) -> str | None:
-    refresh_token = state.kakao_refresh_token
-    client_id = state.kakao_rest_api_key
-
-    if not refresh_token or not client_id:
+    if not state.kakao_refresh_token or not state.kakao_rest_api_key:
         return None
 
     url = "https://kauth.kakao.com/oauth/token"
     data = {
         "grant_type": "refresh_token",
-        "client_id": client_id,
-        "refresh_token": refresh_token,
+        "client_id": state.kakao_rest_api_key,
+        "refresh_token": state.kakao_refresh_token,
     }
     if state.kakao_client_secret:
         data["client_secret"] = state.kakao_client_secret
@@ -912,9 +923,10 @@ def refresh_kakao_token(state: AppState) -> str | None:
     _update_env("KAKAO_ACCESS_TOKEN", new_token, state)
     state.kakao_access_token = new_token
 
-    if result.get("refresh_token"):
-        _update_env("KAKAO_REFRESH_TOKEN", result["refresh_token"], state)
-        state.kakao_refresh_token = result["refresh_token"]
+    new_refresh_token = result.get("refresh_token")
+    if new_refresh_token:
+        _update_env("KAKAO_REFRESH_TOKEN", new_refresh_token, state)
+        state.kakao_refresh_token = new_refresh_token
 
     safe_print("카카오 토큰 갱신 완료")
     return new_token
@@ -930,7 +942,6 @@ def _update_env(key: str, value: str, state: AppState) -> None:
 def build_today_history_records(news_data: dict[str, list[NewsArticle]], state: AppState) -> list[dict[str, Any]]:
     today = now_kst().strftime("%Y-%m-%d")
     records: list[dict[str, Any]] = []
-
     for category, articles in news_data.items():
         for article in articles:
             records.append({
@@ -941,12 +952,10 @@ def build_today_history_records(news_data: dict[str, list[NewsArticle]], state: 
                 "fingerprint": build_fingerprint(article, state.config),
                 "company": extract_matched_company(article.get("title", ""), state.config),
             })
-
     return records
 
 
 def main() -> None:
-    setup_logging()
     state = load_state()
 
     safe_print("\n" + "=" * 50)
@@ -957,6 +966,7 @@ def main() -> None:
         validate_startup_env(state)
     except Exception as e:
         safe_print(f"환경변수 검증 실패: {e}")
+        append_failed_run(state, "startup_env_failed", {"error": str(e)})
         return
 
     try:
@@ -969,7 +979,15 @@ def main() -> None:
         news_data, stats, health = collect_all_news(state)
     except Exception as e:
         safe_print(f"[오류] 뉴스 수집 실패: {e}")
+        append_failed_run(state, "collect_news_failed", {"error": str(e)})
         send_kakao_message(build_failure_message(str(e)), state)
+        return
+
+    search_failure_reason = evaluate_search_health(state, health)
+    if search_failure_reason:
+        safe_print(f"[오류] {search_failure_reason}")
+        append_failed_run(state, "search_health_failed", {"error": search_failure_reason, "messages": health.messages[:10]})
+        send_kakao_message(build_failure_message(search_failure_reason), state)
         return
 
     plastic_count = len(news_data.get("플라스틱_사출", []))
@@ -990,19 +1008,17 @@ def main() -> None:
         f"grouped {c.get('grouped', 0)} -> fresh {c.get('fresh', 0)} -> final {c.get('final', 0)}"
     )
 
-    if health.failures >= MAX_NEWS_SEARCH_FAILURES:
-        reason = f"뉴스 검색 실패가 기준치를 초과했습니다. 실패 {health.failures}건"
-        safe_print(f"[오류] {reason}")
-        send_kakao_message(build_failure_message(reason), state)
-        return
-
     if total == 0:
         if health.failures > 0:
+            reason = "검색 실패 후 최종 뉴스 0건"
             safe_print("검색 실패가 있었고 최종 뉴스가 0건이라 수집 실패 메시지를 전송합니다.")
-            send_kakao_message(build_failure_message("검색 실패 후 최종 뉴스 0건"), state)
+            append_failed_run(state, "zero_news_after_failures", {"error": reason, "messages": health.messages[:10]})
+            send_kakao_message(build_failure_message(reason), state)
         else:
             safe_print("수집 기준에 맞는 신규 뉴스가 없어 안내 메시지를 전송합니다.")
-            send_kakao_message(build_no_news_message(), state)
+            ok = send_kakao_message(build_no_news_message(), state)
+            if not ok:
+                append_failed_run(state, "send_no_news_failed", {})
         return
 
     safe_print("Claude AI로 요약 중...")
@@ -1010,6 +1026,7 @@ def main() -> None:
         message = summarize_with_claude(news_data, state)
     except Exception as e:
         safe_print(f"Claude 요약 실패: {e}")
+        append_failed_run(state, "claude_failed", {"error": str(e)})
         send_kakao_message(build_failure_message(f"요약 실패: {e}"), state)
         return
 
@@ -1018,6 +1035,9 @@ def main() -> None:
     ok = send_kakao_message(message, state)
     if ok:
         save_history(state, build_today_history_records(news_data, state))
+    else:
+        append_failed_run(state, "send_failed", {"message_length": len(message)})
+        safe_print("[오류] 카카오 발송 실패로 이력은 저장하지 않습니다.")
 
 
 if __name__ == "__main__":
