@@ -4,14 +4,16 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import quote, urljoin
 from zoneinfo import ZoneInfo
 
 import requests
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -48,16 +50,11 @@ except Exception:
     pass
 
 
-NAVER_CLIENT_ID = (os.getenv("NAVER_CLIENT_ID") or "").strip()
-NAVER_CLIENT_SECRET = (os.getenv("NAVER_CLIENT_SECRET") or "").strip()
-ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
-KAKAO_REST_API_KEY = (os.getenv("KAKAO_REST_API_KEY") or "").strip()
-KAKAO_ACCESS_TOKEN = (os.getenv("KAKAO_ACCESS_TOKEN") or "").strip()
-KAKAO_REFRESH_TOKEN = (os.getenv("KAKAO_REFRESH_TOKEN") or "").strip()
-
 REQUEST_TIMEOUT_NEWS = 10
 REQUEST_TIMEOUT_CLAUDE = 30
 REQUEST_TIMEOUT_KAKAO = 10
+REQUEST_TIMEOUT_ARTICLE = 10
+MAX_NEWS_SEARCH_FAILURES = 3
 
 PLACEHOLDER_HINTS = [
     "입력", "여기에", "example", "sample", "replace",
@@ -81,6 +78,12 @@ COMPANY_KEYWORDS: list[str] = [
     "TOPSTAR",
 ]
 
+PLASTIC_QUERIES: list[str] = [
+    "플라스틱 산업 동향",
+    "사출성형 업계",
+    "플라스틱 원자재 가격",
+]
+
 COMPETITOR_QUERIES: list[str] = [
     "유일로보틱스",
     "나우로보틱스",
@@ -92,10 +95,62 @@ COMPETITOR_QUERIES: list[str] = [
     "TOPSTAR robot",
 ]
 
-# 오래된 기사 차단 강화
-# 플라스틱·사출: 0~2일
-# 경쟁사: 0~1일
 CATEGORY_MAX_AGE_DAYS = {"플라스틱_사출": 2, "경쟁사": 1}
+
+DEFAULT_HEADER_LINK = "http://www.abimaneng.com/"
+DEFAULT_SECTION_IMAGES = {
+    "플라스틱_사출": "https://developers.kakao.com/static/images/pc/default.png",
+    "경쟁사": "https://developers.kakao.com/static/images/pc/default.png",
+}
+
+REDIRECT_BASE_URL = "https://minharm.github.io/news-redirect.html?url="
+
+ARTICLE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    )
+}
+
+
+@dataclass
+class AppState:
+    naver_client_id: str
+    naver_client_secret: str
+    anthropic_api_key: str
+    kakao_rest_api_key: str
+    kakao_access_token: str
+    kakao_refresh_token: str
+    kakao_client_secret: str
+    env_path: Path = ENV_PATH
+    history_path: Path = HISTORY_PATH
+
+
+@dataclass
+class SearchHealth:
+    failures: int = 0
+    messages: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.messages is None:
+            self.messages = []
+
+    def add_failure(self, query: str, exc: Exception) -> None:
+        self.failures += 1
+        self.messages.append(f"{query}: {exc}")
+
+
+def load_state() -> AppState:
+    return AppState(
+        naver_client_id=(os.getenv("NAVER_CLIENT_ID") or "").strip(),
+        naver_client_secret=(os.getenv("NAVER_CLIENT_SECRET") or "").strip(),
+        anthropic_api_key=(os.getenv("ANTHROPIC_API_KEY") or "").strip(),
+        kakao_rest_api_key=(os.getenv("KAKAO_REST_API_KEY") or "").strip(),
+        kakao_access_token=(os.getenv("KAKAO_ACCESS_TOKEN") or "").strip(),
+        kakao_refresh_token=(os.getenv("KAKAO_REFRESH_TOKEN") or "").strip(),
+        kakao_client_secret=(os.getenv("KAKAO_CLIENT_SECRET") or "").strip(),
+    )
 
 
 def _looks_like_placeholder(value: str) -> bool:
@@ -122,13 +177,14 @@ def validate_header_env(name: str, value: str | None, *, required: bool = True) 
         raise ValueError(f"환경변수 {name} 값에 한글 또는 비ASCII 문자가 포함되어 있습니다: {stripped!r}") from exc
 
 
-def validate_startup_env() -> None:
-    validate_header_env("NAVER_CLIENT_ID", NAVER_CLIENT_ID)
-    validate_header_env("NAVER_CLIENT_SECRET", NAVER_CLIENT_SECRET)
-    validate_header_env("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
-    validate_header_env("KAKAO_ACCESS_TOKEN", KAKAO_ACCESS_TOKEN, required=False)
-    validate_header_env("KAKAO_REFRESH_TOKEN", KAKAO_REFRESH_TOKEN, required=False)
-    validate_header_env("KAKAO_REST_API_KEY", KAKAO_REST_API_KEY, required=False)
+def validate_startup_env(state: AppState) -> None:
+    validate_header_env("NAVER_CLIENT_ID", state.naver_client_id)
+    validate_header_env("NAVER_CLIENT_SECRET", state.naver_client_secret)
+    validate_header_env("ANTHROPIC_API_KEY", state.anthropic_api_key)
+    validate_header_env("KAKAO_ACCESS_TOKEN", state.kakao_access_token, required=False)
+    validate_header_env("KAKAO_REFRESH_TOKEN", state.kakao_refresh_token, required=False)
+    validate_header_env("KAKAO_REST_API_KEY", state.kakao_rest_api_key, required=False)
+    validate_header_env("KAKAO_CLIENT_SECRET", state.kakao_client_secret, required=False)
 
 
 def strip_html(text: str) -> str:
@@ -251,11 +307,11 @@ def article_score(article: dict[str, str], category: str) -> int:
     return score
 
 
-def search_naver_news(query: str, display: int = 5) -> list[dict[str, str]]:
+def search_naver_news(query: str, state: AppState, display: int = 5) -> list[dict[str, str]]:
     url = "https://openapi.naver.com/v1/search/news.json"
     headers = {
-        "X-Naver-Client-Id": NAVER_CLIENT_ID,
-        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        "X-Naver-Client-Id": state.naver_client_id,
+        "X-Naver-Client-Secret": state.naver_client_secret,
     }
     params = {"query": query, "display": display, "sort": "date"}
 
@@ -271,12 +327,12 @@ def search_naver_news(query: str, display: int = 5) -> list[dict[str, str]]:
             "description": strip_html(item.get("description", "")),
             "link": item.get("originallink") or item.get("link") or "",
             "pubDate": item.get("pubDate", ""),
+            "image_url": "",
         })
 
     return results
 
 
-# 중복 기사 묶기 강화
 def group_similar_articles(articles: list[dict[str, str]], category: str) -> list[dict[str, str]]:
     groups: list[list[dict[str, str]]] = []
 
@@ -338,11 +394,11 @@ def group_similar_articles(articles: list[dict[str, str]], category: str) -> lis
     return selected
 
 
-def load_history() -> list[dict[str, str]]:
-    if not HISTORY_PATH.exists():
+def load_history(state: AppState) -> list[dict[str, str]]:
+    if not state.history_path.exists():
         return []
     try:
-        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+        with open(state.history_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             return [x for x in data if isinstance(x, dict)]
@@ -351,19 +407,18 @@ def load_history() -> list[dict[str, str]]:
         return []
 
 
-def save_history(today_records: list[dict[str, str]]) -> None:
-    history = load_history()
+def save_history(state: AppState, today_records: list[dict[str, str]]) -> None:
+    history = load_history(state)
     history.extend(today_records)
     cutoff = (now_kst() - timedelta(days=14)).strftime("%Y-%m-%d")
     trimmed = [x for x in history if x.get("date", "") >= cutoff]
     try:
-        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+        with open(state.history_path, "w", encoding="utf-8") as f:
             json.dump(trimmed, f, ensure_ascii=False, indent=2)
     except Exception as e:
         safe_print(f"[경고] 발송 이력 저장 실패: {e}")
 
 
-# 최근 발송 이력 중복 기준 강화
 def is_recent_duplicate(article: dict[str, str], recent_history: list[dict[str, str]]) -> bool:
     title = article.get("title", "")
     link = article.get("link", "")
@@ -401,15 +456,14 @@ def is_recent_duplicate(article: dict[str, str], recent_history: list[dict[str, 
     return False
 
 
-def get_recent_history(days: int = 3) -> list[dict[str, str]]:
-    history = load_history()
+def get_recent_history(state: AppState, days: int = 3) -> list[dict[str, str]]:
+    history = load_history(state)
     cutoff = (now_kst() - timedelta(days=days)).strftime("%Y-%m-%d")
     return [x for x in history if x.get("date", "") >= cutoff]
 
 
-# 오늘 수집분끼리도 중복 차단
-def filter_recent_duplicates(articles: list[dict[str, str]]) -> list[dict[str, str]]:
-    recent = get_recent_history(days=3)
+def filter_recent_duplicates(articles: list[dict[str, str]], state: AppState) -> list[dict[str, str]]:
+    recent = get_recent_history(state, days=3)
     kept: list[dict[str, str]] = []
 
     for article in articles:
@@ -439,263 +493,418 @@ def filter_recent_duplicates(articles: list[dict[str, str]]) -> list[dict[str, s
     return kept
 
 
-def collect_all_news() -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[str, int]]]:
-    plastic_queries = ["플라스틱 산업 동향", "사출성형 업계", "플라스틱 원자재 가격"]
-    category_limits = {"플라스틱_사출": 3, "경쟁사": 3}
+def _dedupe_raw_articles(articles: list[dict[str, str]]) -> list[dict[str, str]]:
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for article in articles:
+        key = f"{article.get('title', '')}|{article.get('link', '')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(article)
+    return deduped
+
+
+def _collect_category(
+    *,
+    queries: list[str],
+    category: str,
+    limit: int,
+    state: AppState,
+    health: SearchHealth,
+    article_filter: Callable[[dict[str, str]], bool] | None = None,
+) -> tuple[list[dict[str, str]], dict[str, int]]:
+    raw_articles: list[dict[str, str]] = []
+
+    for query in queries:
+        try:
+            raw_articles.extend(search_naver_news(query, state, display=3))
+        except Exception as e:
+            health.add_failure(query, e)
+            safe_print(f"[경고] '{query}' 검색 실패: {e}")
+
+    deduped_articles = _dedupe_raw_articles(raw_articles)
+
+    filtered_articles = deduped_articles
+    filtered_out_count = 0
+    if article_filter is not None:
+        filtered_articles = [a for a in deduped_articles if article_filter(a)]
+        filtered_out_count = len(deduped_articles) - len(filtered_articles)
+        if filtered_out_count > 0:
+            safe_print(f"   [{category} 필터] 관련없는 기사 {filtered_out_count}건 차단됨")
+
+    grouped_articles = group_similar_articles(filtered_articles, category)
+    fresh_articles = [a for a in grouped_articles if is_fresh_enough(a, category)]
+    final_articles = filter_recent_duplicates(fresh_articles, state)
+    final_articles.sort(
+        key=lambda x: (
+            article_score(x, category),
+            int(x.get("_group_size", "1")),
+            len(x.get("description", "")),
+        ),
+        reverse=True,
+    )
+
+    stats: dict[str, int] = {
+        "raw": len(raw_articles),
+        "deduped": len(deduped_articles),
+        "grouped": len(grouped_articles),
+        "fresh": len(fresh_articles),
+        "final": len(final_articles[:limit]),
+    }
+    if article_filter is not None:
+        stats["filtered_out"] = filtered_out_count
+
+    return final_articles[:limit], stats
+
+
+def collect_all_news(state: AppState) -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[str, int]]]:
     collected: dict[str, list[dict[str, str]]] = {}
     stats: dict[str, dict[str, int]] = {}
+    health = SearchHealth()
 
-    raw_plastic: list[dict[str, str]] = []
-    for q in plastic_queries:
-        try:
-            raw_plastic.extend(search_naver_news(q, display=3))
-        except Exception as e:
-            safe_print(f"[경고] '{q}' 검색 실패: {e}")
-
-    deduped_plastic: list[dict[str, str]] = []
-    seen_keys: set[str] = set()
-    for a in raw_plastic:
-        key = f"{a.get('title', '')}|{a.get('link', '')}"
-        if key not in seen_keys:
-            seen_keys.add(key)
-            deduped_plastic.append(a)
-
-    grouped_plastic = group_similar_articles(deduped_plastic, "플라스틱_사출")
-    fresh_plastic = [a for a in grouped_plastic if is_fresh_enough(a, "플라스틱_사출")]
-    final_plastic = filter_recent_duplicates(fresh_plastic)
-    final_plastic.sort(
-        key=lambda x: (
-            article_score(x, "플라스틱_사출"),
-            int(x.get("_group_size", "1")),
-            len(x.get("description", "")),
-        ),
-        reverse=True,
+    collected["플라스틱_사출"], stats["플라스틱_사출"] = _collect_category(
+        queries=PLASTIC_QUERIES,
+        category="플라스틱_사출",
+        limit=3,
+        state=state,
+        health=health,
     )
-    collected["플라스틱_사출"] = final_plastic[:category_limits["플라스틱_사출"]]
-    stats["플라스틱_사출"] = {
-        "raw": len(raw_plastic),
-        "grouped": len(grouped_plastic),
-        "fresh": len(fresh_plastic),
-        "final": len(collected["플라스틱_사출"]),
-    }
 
-    raw_competitor: list[dict[str, str]] = []
-    for q in COMPETITOR_QUERIES:
-        try:
-            raw_competitor.extend(search_naver_news(q, display=3))
-        except Exception as e:
-            safe_print(f"[경고] '{q}' 검색 실패: {e}")
-
-    deduped_competitor: list[dict[str, str]] = []
-    seen_keys2: set[str] = set()
-    for a in raw_competitor:
-        key = f"{a.get('title', '')}|{a.get('link', '')}"
-        if key not in seen_keys2:
-            seen_keys2.add(key)
-            deduped_competitor.append(a)
-
-    company_filtered = [a for a in deduped_competitor if is_valid_competitor_article(a)]
-    blocked_count = len(deduped_competitor) - len(company_filtered)
-    if blocked_count > 0:
-        safe_print(f"   [경쟁사 필터] 관련없는 기사 {blocked_count}건 차단됨")
-
-    grouped_competitor = group_similar_articles(company_filtered, "경쟁사")
-    fresh_competitor = [a for a in grouped_competitor if is_fresh_enough(a, "경쟁사")]
-    final_competitor = filter_recent_duplicates(fresh_competitor)
-    final_competitor.sort(
-        key=lambda x: (
-            article_score(x, "경쟁사"),
-            int(x.get("_group_size", "1")),
-            len(x.get("description", "")),
-        ),
-        reverse=True,
+    collected["경쟁사"], stats["경쟁사"] = _collect_category(
+        queries=COMPETITOR_QUERIES,
+        category="경쟁사",
+        limit=3,
+        state=state,
+        health=health,
+        article_filter=is_valid_competitor_article,
     )
-    collected["경쟁사"] = final_competitor[:category_limits["경쟁사"]]
-    stats["경쟁사"] = {
-        "raw": len(raw_competitor),
-        "company_filtered": len(company_filtered),
-        "grouped": len(grouped_competitor),
-        "fresh": len(fresh_competitor),
-        "final": len(collected["경쟁사"]),
-    }
+
+    if health.failures >= MAX_NEWS_SEARCH_FAILURES:
+        raise RuntimeError(
+            f"네이버 뉴스 API 실패가 {health.failures}건 발생했습니다: "
+            + " | ".join(health.messages[:5])
+        )
 
     return collected, stats
 
 
-def summarize_with_claude(news_data: dict[str, list[dict[str, str]]]) -> str:
+def trim_text(text: str, max_len: int) -> str:
+    text = re.sub(r"\s+", " ", strip_html(text)).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def make_short_title(title: str, rank: int) -> str:
+    title = strip_html(title)
+    title = re.sub(r"^\[[^\]]+\]\s*", "", title).strip()
+    title = re.sub(r"\s+", " ", title).strip()
+    title = trim_text(title, 30)
+    return f"{rank}. {title}"
+
+
+def make_short_description(desc: str) -> str:
+    desc = strip_html(desc)
+    desc = re.sub(r"\s+", " ", desc).strip()
+    if not desc:
+        return "기사 내용을 눌러 확인해 주세요."
+    return trim_text(desc, 55)
+
+
+def build_registered_redirect_url(article_url: str) -> str:
+    if not article_url:
+        article_url = DEFAULT_HEADER_LINK
+    return REDIRECT_BASE_URL + quote(article_url, safe="")
+
+
+def build_link(url: str) -> dict[str, str]:
+    final_url = build_registered_redirect_url(url)
+    return {
+        "web_url": final_url,
+        "mobile_web_url": final_url,
+    }
+
+
+def build_homepage_link() -> dict[str, str]:
+    return build_link(DEFAULT_HEADER_LINK)
+
+
+def extract_meta_image(html: str, base_url: str) -> str:
+    patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+        r'<meta[^>]+itemprop=["\']image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+itemprop=["\']image["\']',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if match:
+            image_url = match.group(1).strip()
+            if image_url:
+                return urljoin(base_url, image_url)
+
+    img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    if img_match:
+        return urljoin(base_url, img_match.group(1).strip())
+
+    return ""
+
+
+def fetch_article_image(url: str, category: str) -> str:
+    if not url:
+        return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+    try:
+        resp = requests.get(
+            url,
+            headers=ARTICLE_HEADERS,
+            timeout=REQUEST_TIMEOUT_ARTICLE,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+            return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+        html = resp.text[:300000]
+        image_url = extract_meta_image(html, resp.url)
+        if image_url:
+            return image_url
+    except Exception:
+        pass
+
+    return DEFAULT_SECTION_IMAGES.get(category, DEFAULT_SECTION_IMAGES["플라스틱_사출"])
+
+
+def enrich_article_images(news_data: dict[str, list[dict[str, str]]]) -> None:
+    for category, articles in news_data.items():
+        for article in articles:
+            if article.get("image_url"):
+                continue
+            article["image_url"] = fetch_article_image(article.get("link", ""), category)
+            safe_print(f"   [이미지] {category} - {trim_text(article.get('title', ''), 28)}")
+
+
+def summarize_with_claude(news_data: dict[str, list[dict[str, str]]], state: AppState) -> str:
     total_count = sum(len(v) for v in news_data.values())
     if total_count == 0:
-        raise ValueError("요약할 뉴스가 없습니다.")
+        return "오늘은 발송 기준에 맞는 신규 뉴스가 없습니다."
 
-    label_map = {"플라스틱_사출": "플라스틱·사출 업계", "경쟁사": "취출기 경쟁사"}
     news_text_parts: list[str] = []
-    category_counts: dict[str, int] = {}
-
     for category in ["플라스틱_사출", "경쟁사"]:
         articles = news_data.get(category, [])
-        label = label_map[category]
-        category_counts[category] = len(articles)
-
         if not articles:
             continue
 
+        label = "플라스틱·사출 업계" if category == "플라스틱_사출" else "취출기 경쟁사"
         news_text_parts.append(f"\n[{label}]")
-        for article in articles:
-            group_note = ""
-            if int(article.get("_group_size", "1")) > 1:
-                group_note = f" (유사 기사 {article.get('_group_size')}건 묶음)"
+        for article in articles[:3]:
             news_text_parts.append(
-                f"- 제목: {article['title']}{group_note}\n"
-                f"  내용: {article['description']}\n"
-                f"  링크: {article['link']}"
+                f"- 제목: {article.get('title', '')}\n"
+                f"  내용: {article.get('description', '')}"
             )
 
-    news_text = "\n".join(news_text_parts)
-    today = now_kst().strftime("%Y년 %m월 %d일")
-
-    competitor_guide = (
-        "취출기 경쟁사 뉴스가 한 건도 없으면 해당 섹션은 아예 출력하지 마세요."
-        if category_counts.get("경쟁사", 0) == 0
-        else "취출기 경쟁사 섹션은 실제 수집된 기사만 포함하세요."
-    )
-
-    prompt = f'''오늘({today}) 뉴스를 카카오톡 메시지용 깔끔한 뉴스레터 형식으로 정리해 주세요.
+    prompt = f"""다음 뉴스들을 보고 카카오톡 상단 인사말에 들어갈 짧은 요약만 작성해 주세요.
 
 [원본 뉴스]
-{news_text}
+{chr(10).join(news_text_parts)}
 
-[카테고리별 수집 건수]
-- 플라스틱·사출 업계: {category_counts.get("플라스틱_사출", 0)}건
-- 취출기 경쟁사: {category_counts.get("경쟁사", 0)}건
+[규칙]
+- 한국어
+- 2줄 이내
+- 첫 줄은 반드시: 안녕하세요!
+- 둘째 줄은 오늘 전체 뉴스 흐름을 한 문장으로 요약
+- 70자 내외
+- 불필요한 이모지 금지
+"""
 
-[작성 규칙]
-- 전체 톤은 정돈된 비즈니스 뉴스레터 스타일로 작성
-- 과한 이모지, 과장 표현, 불필요한 감탄 표현은 사용 금지
-- 이모지는 제목 줄의 신문 아이콘 1개만 허용
-- 맨 위 제목은 반드시 다음 형식으로 작성:
-  "{today} | 오늘의 뉴스 브리핑 📰"
-- 제목 아래에는 아래 형식으로 인사말 2줄을 작성
-  1줄: "안녕하세요."
-  2줄: 오늘 전체 뉴스 흐름을 요약하는 한 줄 코멘트
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": state.anthropic_api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=REQUEST_TIMEOUT_CLAUDE,
+        )
+        response.raise_for_status()
 
-- 섹션 순서는 반드시:
-  1. 플라스틱·사출 업계
-  2. 취출기 경쟁사
+        data: dict[str, Any] = response.json()
+        content = data.get("content", [])
+        if content and isinstance(content, list):
+            first = content[0]
+            text = first.get("text") if isinstance(first, dict) else None
+            if text:
+                return text.strip()
+    except Exception as e:
+        safe_print(f"[경고] Claude 상단 요약 실패: {e}")
 
-- 각 섹션은 실제 수집된 뉴스가 있을 때만 출력
-- {competitor_guide}
+    return "안녕하세요!\n오늘 꼭 챙겨봐야 할 핵심 소식들입니다."
 
-- 각 섹션 제목은 반드시 아래처럼 구분선을 포함해 작성:
-━━━━━━━━━━
-플라스틱·사출 업계
-━━━━━━━━━━
 
-━━━━━━━━━━
-취출기 경쟁사
-━━━━━━━━━━
-
-- 각 뉴스는 반드시 아래 형식으로 작성:
-  1) 짧은 제목
-  - 핵심 내용 한 줄 요약
-  기사 원문
-  링크주소
-
-- "링크", "원문 링크", "URL" 같은 표현 대신 반드시 "기사 원문" 이라고만 작성
-- "기사 원문" 다음 줄에 실제 링크 주소를 그대로 넣을 것
-- 기사 제목을 길게 그대로 복붙하지 말고, 16~26자 내외의 짧은 제목으로 정리
-- 핵심 내용은 1문장으로만 작성
-- 유사 기사 묶음이라고 표시된 경우, 묶인 기사의 공통 핵심 이슈로 자연스럽게 요약
-- 원본 뉴스에 없는 사실은 절대 추가하지 말 것
-- 각 카테고리는 수집된 기사만 기준으로 최대 3건 출력
-- 전체 길이는 1,100자 이내
-- 마지막 문구는 반드시: "아비만 뉴스봇 자동 발송 메시지입니다."
-- 마크다운 굵게(**)는 사용하지 말 것
-'''
-
-    response = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1500,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=REQUEST_TIMEOUT_CLAUDE,
-    )
-    response.raise_for_status()
-
-    data: dict[str, Any] = response.json()
-    content = data.get("content", [])
-    if not content or not isinstance(content, list):
-        raise ValueError(f"Claude 응답 형식이 예상과 다릅니다: {data}")
-
-    first = content[0]
-    text = first.get("text") if isinstance(first, dict) else None
-    if not text:
-        raise ValueError(f"Claude 응답 본문이 비어 있습니다: {data}")
-
-    return text
+def build_intro_text(summary_text: str) -> str:
+    today = now_kst().strftime("%Y년 %m월 %d일")
+    summary_text = (summary_text or "").strip()
+    if not summary_text:
+        summary_text = "안녕하세요!\n오늘 꼭 챙겨봐야 할 핵심 소식들입니다."
+    return f"📰 {today} | 뉴스 브리핑\n\n{summary_text}"
 
 
 def build_no_news_message() -> str:
     today = now_kst().strftime("%Y년 %m월 %d일")
     return (
-        f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
-        "안녕하세요.\n"
+        f"📰 {today} | 뉴스 브리핑\n\n"
+        "안녕하세요!\n"
         "오늘은 발송 기준에 맞는 신규 뉴스가 없어 요약을 생략합니다.\n\n"
         "아비만 뉴스봇 자동 발송 메시지입니다."
     )
 
 
-def send_kakao_message(text: str) -> bool:
-    if not KAKAO_ACCESS_TOKEN:
+def build_section_header(category: str) -> str:
+    if category == "플라스틱_사출":
+        return "📍 플라스틱·사출 업계"
+    if category == "경쟁사":
+        return "📍 취출기 경쟁사"
+    return "📍 뉴스"
+
+
+def article_to_content(article: dict[str, str], rank: int, category: str) -> dict[str, Any]:
+    image_url = article.get("image_url") or DEFAULT_SECTION_IMAGES.get(
+        category, DEFAULT_SECTION_IMAGES["플라스틱_사출"]
+    )
+
+    return {
+        "title": make_short_title(article.get("title", ""), rank),
+        "description": make_short_description(article.get("description", "")),
+        "image_url": image_url,
+        "image_width": 640,
+        "image_height": 640,
+        "link": build_link(article.get("link", "")),
+    }
+
+
+def build_list_template(category: str, articles: list[dict[str, str]]) -> dict[str, Any]:
+    header_title = build_section_header(category)
+    first_link = articles[0].get("link", DEFAULT_HEADER_LINK) if articles else DEFAULT_HEADER_LINK
+    contents = [article_to_content(article, idx + 1, category) for idx, article in enumerate(articles[:3])]
+
+    return {
+        "object_type": "list",
+        "header_title": header_title,
+        "header_link": build_link(first_link),
+        "contents": contents,
+        "button_title": "전체 기사 보기",
+        "buttons": [
+            {
+                "title": "전체 기사 보기",
+                "link": build_link(first_link),
+            }
+        ],
+    }
+
+
+def build_feed_template(category: str, article: dict[str, str]) -> dict[str, Any]:
+    header_title = build_section_header(category)
+    image_url = article.get("image_url") or DEFAULT_SECTION_IMAGES.get(
+        category, DEFAULT_SECTION_IMAGES["플라스틱_사출"]
+    )
+
+    return {
+        "object_type": "feed",
+        "content": {
+            "title": header_title,
+            "description": f"{make_short_title(article.get('title', ''), 1)}\n{make_short_description(article.get('description', ''))}",
+            "image_url": image_url,
+            "image_width": 640,
+            "image_height": 640,
+            "link": build_link(article.get("link", "")),
+        },
+        "button_title": "전체 기사 보기",
+        "buttons": [
+            {
+                "title": "전체 기사 보기",
+                "link": build_link(article.get("link", "")),
+            }
+        ],
+    }
+
+
+def send_kakao_default_template(template_object: dict[str, Any], state: AppState) -> bool:
+    if not state.kakao_access_token:
         safe_print("KAKAO_ACCESS_TOKEN 이 없어 카카오톡 전송을 할 수 없습니다.")
         return False
 
     url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
     headers = {
-        "Authorization": f"Bearer {KAKAO_ACCESS_TOKEN}",
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": f"Bearer {state.kakao_access_token}",
+        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
     }
-    template = {
-        "object_type": "text",
-        "text": text,
-        "link": {
-            "web_url": "https://www.naver.com",
-            "mobile_web_url": "https://www.naver.com",
-        },
-        "button_title": "뉴스 더 보기",
-    }
-    data = {"template_object": json.dumps(template, ensure_ascii=False)}
+    data = {"template_object": json.dumps(template_object, ensure_ascii=False)}
 
     resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+
+    safe_print(f"[카카오 응답] status={resp.status_code}")
+    safe_print(f"[카카오 응답 본문] {resp.text}")
+
     if resp.status_code == 200:
-        safe_print("카카오톡 전송 성공!")
         return True
 
-    safe_print(f"카카오톡 전송 실패: {resp.status_code} - {resp.text}")
     return False
 
 
-def refresh_kakao_token() -> str | None:
-    refresh_token = KAKAO_REFRESH_TOKEN
-    client_id = KAKAO_REST_API_KEY
+def send_intro_message(summary_text: str, state: AppState) -> bool:
+    template = {
+        "object_type": "text",
+        "text": build_intro_text(summary_text),
+        "link": build_homepage_link(),
+        "button_title": "아비만로보틱스홈페이지",
+    }
 
-    if not refresh_token or not client_id:
+    safe_print("[인트로 템플릿]", json.dumps(template, ensure_ascii=False, indent=2))
+    return send_kakao_default_template(template, state)
+
+
+def send_section_message(category: str, articles: list[dict[str, str]], state: AppState) -> bool:
+    if not articles:
+        return True
+
+    if len(articles) >= 2:
+        template = build_list_template(category, articles[:3])
+    else:
+        template = build_feed_template(category, articles[0])
+
+    safe_print(f"[전송 템플릿] {json.dumps(template, ensure_ascii=False, indent=2)}")
+    return send_kakao_default_template(template, state)
+
+
+def refresh_kakao_token(state: AppState) -> str | None:
+    if not state.kakao_refresh_token or not state.kakao_rest_api_key:
         return None
 
     url = "https://kauth.kakao.com/oauth/token"
     data = {
         "grant_type": "refresh_token",
-        "client_id": client_id,
-        "refresh_token": refresh_token,
+        "client_id": state.kakao_rest_api_key,
+        "refresh_token": state.kakao_refresh_token,
     }
+    if state.kakao_client_secret:
+        data["client_secret"] = state.kakao_client_secret
 
     resp = requests.post(url, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+    safe_print(f"[카카오 토큰 갱신 응답] status={resp.status_code}")
+    safe_print(f"[카카오 토큰 갱신 응답 본문] {resp.text}")
     resp.raise_for_status()
 
     result = resp.json()
@@ -703,31 +912,21 @@ def refresh_kakao_token() -> str | None:
     if not new_token:
         raise ValueError(f"카카오 토큰 갱신 응답에 access_token 이 없습니다: {result}")
 
-    _update_env("KAKAO_ACCESS_TOKEN", new_token)
-    if result.get("refresh_token"):
-        _update_env("KAKAO_REFRESH_TOKEN", result["refresh_token"])
+    _update_env("KAKAO_ACCESS_TOKEN", new_token, state)
+    state.kakao_access_token = new_token
+
+    new_refresh_token = result.get("refresh_token")
+    if new_refresh_token:
+        _update_env("KAKAO_REFRESH_TOKEN", new_refresh_token, state)
+        state.kakao_refresh_token = new_refresh_token
 
     safe_print("카카오 토큰 갱신 완료")
     return new_token
 
 
-def _update_env(key: str, value: str) -> None:
+def _update_env(key: str, value: str, state: AppState) -> None:
     try:
-        lines: list[str] = []
-        if ENV_PATH.exists():
-            with open(ENV_PATH, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-
-        found = False
-        with open(ENV_PATH, "w", encoding="utf-8") as f:
-            for line in lines:
-                if line.startswith(f"{key}="):
-                    f.write(f"{key}={value}\n")
-                    found = True
-                else:
-                    f.write(line)
-            if not found:
-                f.write(f"{key}={value}\n")
+        set_key(str(state.env_path), key, value)
     except Exception as e:
         safe_print(f"[경고] .env 업데이트 실패: {e}")
 
@@ -751,31 +950,29 @@ def build_today_history_records(news_data: dict[str, list[dict[str, str]]]) -> l
 
 
 def main() -> None:
-    global KAKAO_ACCESS_TOKEN, KAKAO_REFRESH_TOKEN
+    state = load_state()
 
     safe_print("\n" + "=" * 50)
     safe_print(f"  뉴스봇 실행: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
     safe_print("=" * 50 + "\n")
 
     try:
-        validate_startup_env()
+        validate_startup_env(state)
     except Exception as e:
         safe_print(f"환경변수 검증 실패: {e}")
         return
 
     try:
-        new_token = refresh_kakao_token()
-        if new_token:
-            os.environ["KAKAO_ACCESS_TOKEN"] = new_token
-            KAKAO_ACCESS_TOKEN = new_token
-            refreshed_refresh = (os.getenv("KAKAO_REFRESH_TOKEN") or "").strip()
-            if refreshed_refresh:
-                KAKAO_REFRESH_TOKEN = refreshed_refresh
+        refresh_kakao_token(state)
     except Exception as e:
         safe_print(f"[경고] 카카오 토큰 갱신 실패: {e}")
 
     safe_print("뉴스 수집 중...")
-    news_data, stats = collect_all_news()
+    try:
+        news_data, stats = collect_all_news(state)
+    except Exception as e:
+        safe_print(f"[오류] 뉴스 수집 실패: {e}")
+        return
 
     plastic_count = len(news_data.get("플라스틱_사출", []))
     competitor_count = len(news_data.get("경쟁사", []))
@@ -787,31 +984,53 @@ def main() -> None:
     p = stats.get("플라스틱_사출", {})
     c = stats.get("경쟁사", {})
     safe_print(
-        f"      [플라스틱] raw {p.get('raw', 0)} -> grouped {p.get('grouped', 0)} -> "
-        f"fresh {p.get('fresh', 0)} -> final {p.get('final', 0)}"
+        f"      [플라스틱] raw {p.get('raw', 0)} -> deduped {p.get('deduped', 0)} -> "
+        f"grouped {p.get('grouped', 0)} -> fresh {p.get('fresh', 0)} -> final {p.get('final', 0)}"
     )
     safe_print(
-        f"      [경쟁사] raw {c.get('raw', 0)} -> 업체필터 {c.get('company_filtered', 0)} -> "
-        f"grouped {c.get('grouped', 0)} -> fresh {c.get('fresh', 0)} -> final {c.get('final', 0)}"
+        f"      [경쟁사] raw {c.get('raw', 0)} -> deduped {c.get('deduped', 0)} -> "
+        f"업체필터 {c.get('filtered_out', 0)}건 제외 -> grouped {c.get('grouped', 0)} -> "
+        f"fresh {c.get('fresh', 0)} -> final {c.get('final', 0)}"
     )
 
     if total == 0:
         safe_print("수집 기준에 맞는 신규 뉴스가 없어 안내 메시지를 전송합니다.")
-        send_kakao_message(build_no_news_message())
+        ok = send_kakao_default_template({
+            "object_type": "text",
+            "text": build_no_news_message(),
+            "link": build_homepage_link(),
+            "button_title": "확인",
+        }, state)
+        if ok:
+            safe_print("카카오톡 전송 성공!")
         return
 
-    safe_print("Claude AI로 요약 중...")
-    try:
-        message = summarize_with_claude(news_data)
-    except Exception as e:
-        safe_print(f"Claude 요약 실패: {e}")
-        return
+    safe_print("기사 이미지 수집 중...")
+    enrich_article_images(news_data)
 
-    safe_print(f"요약 완료 ({len(message)}자)")
+    safe_print("상단 뉴스 브리핑 요약 생성 중...")
+    intro_summary = summarize_with_claude(news_data, state)
+
     safe_print("카카오톡 전송 중...")
-    ok = send_kakao_message(message)
-    if ok:
-        save_history(build_today_history_records(news_data))
+    success = True
+
+    if not send_intro_message(intro_summary, state):
+        success = False
+        safe_print("[오류] 인트로 메시지 전송 실패")
+
+    if plastic_count > 0:
+        if not send_section_message("플라스틱_사출", news_data["플라스틱_사출"], state):
+            success = False
+            safe_print("[오류] 플라스틱·사출 업계 메시지 전송 실패")
+
+    if competitor_count > 0:
+        if not send_section_message("경쟁사", news_data["경쟁사"], state):
+            success = False
+            safe_print("[오류] 취출기 경쟁사 메시지 전송 실패")
+
+    if success:
+        save_history(state, build_today_history_records(news_data))
+        safe_print("카카오톡 전송 성공!")
 
 
 if __name__ == "__main__":
