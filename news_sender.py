@@ -85,11 +85,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "경쟁사": 1,
     },
     "stock_exclude_keywords": [
-        "주가", "급등", "급락", "상한가", "하한가", "매수", "매도",
-        "투자주의", "투자경고", "시총", "시가총액", "증권", "리포트", "목표주가",
-        "per", "pbr", "eps", "코스피", "코스닥", "공모가", "차트", "수급",
-        "기관 순매수", "외국인 순매수", "주식", "종목", "테마주",
-        "배당", "호재", "악재", "투자자",
+        "상한가", "하한가", "목표주가", "투자주의", "투자경고",
+        "기관 순매수", "외국인 순매수", "시가총액", "공모가"
+    ],
+    "stock_penalty_keywords": [
+        "주가", "급등", "급락", "매수", "매도", "시총", "증권", "리포트",
+        "코스피", "코스닥", "차트", "수급", "주식", "종목", "테마주",
+        "배당", "호재", "악재", "투자자", "per", "pbr", "eps"
     ],
 }
 
@@ -152,6 +154,7 @@ class AppConfig:
     category_limits: dict[str, int]
     category_max_age_days: dict[str, int]
     stock_exclude_keywords: list[str]
+    stock_penalty_keywords: list[str]
     claude_model: str
 
     @classmethod
@@ -177,6 +180,7 @@ class AppConfig:
             category_limits=get_dict_config(data, "category_limits", DEFAULT_CONFIG["category_limits"], min_value=1),
             category_max_age_days=get_dict_config(data, "category_max_age_days", DEFAULT_CONFIG["category_max_age_days"], min_value=0),
             stock_exclude_keywords=get_list_config(data, "stock_exclude_keywords", DEFAULT_CONFIG["stock_exclude_keywords"]),
+            stock_penalty_keywords=get_list_config(data, "stock_penalty_keywords", DEFAULT_CONFIG["stock_penalty_keywords"]),
             claude_model=get_str_config(data, "claude_model", DEFAULT_CLAUDE_MODEL),
         )
 
@@ -363,9 +367,27 @@ def contains_stock_keyword(text: str, keywords: list[str]) -> bool:
     return False
 
 
+def stock_keyword_count(text: str, keywords: list[str]) -> int:
+    count = 0
+    for keyword in keywords:
+        if re.fullmatch(r"[a-zA-Z0-9]+", keyword):
+            if re.search(rf"\b{re.escape(keyword)}\b", text, re.IGNORECASE):
+                count += 1
+        else:
+            if keyword.lower() in text:
+                count += 1
+    return count
+
+
 def is_stock_related_article(article: NewsArticle, config: AppConfig) -> bool:
     combined = normalize_text(f"{article.get('title', '')} {article.get('description', '')}")
     return contains_stock_keyword(combined, config.stock_exclude_keywords)
+
+
+def get_stock_penalty(article: NewsArticle, config: AppConfig) -> int:
+    combined = normalize_text(f"{article.get('title', '')} {article.get('description', '')}")
+    penalty_hits = stock_keyword_count(combined, config.stock_penalty_keywords)
+    return penalty_hits * 3
 
 
 COMPETITOR_RELEVANCE_KEYWORDS = [
@@ -442,6 +464,8 @@ def article_score(article: NewsArticle, category: str, config: AppConfig) -> int
             score += 2
         else:
             score -= age_days * 2
+
+    score -= get_stock_penalty(article, config)
 
     return score
 
