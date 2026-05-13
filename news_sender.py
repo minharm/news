@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -103,7 +104,13 @@ def get_list_config(data: dict[str, Any], key: str, default: list[str]) -> list[
     return result or list(default)
 
 
-def get_dict_config(data: dict[str, Any], key: str, default: dict[str, int]) -> dict[str, int]:
+def get_dict_config(
+    data: dict[str, Any],
+    key: str,
+    default: dict[str, int],
+    *,
+    min_value: int = 0,
+) -> dict[str, int]:
     value = data.get(key, default)
     if not isinstance(value, dict):
         safe_print(f"[경고] {key} 설정이 객체가 아니어서 기본값을 사용합니다.")
@@ -112,10 +119,21 @@ def get_dict_config(data: dict[str, Any], key: str, default: dict[str, int]) -> 
     result: dict[str, int] = {}
     for k, v in value.items():
         try:
-            result[str(k)] = max(int(v), 0)
+            result[str(k)] = max(int(v), min_value)
         except Exception:
             safe_print(f"[경고] {key}.{k} 값이 숫자가 아니어서 제외합니다.")
     return result or dict(default)
+
+
+def get_str_config(data: dict[str, Any], key: str, default: str) -> str:
+    env_name = key.upper()
+    env_value = os.getenv(env_name)
+    value = env_value if env_value is not None else data.get(key, default)
+    if not isinstance(value, str):
+        safe_print(f"[경고] {key} 설정이 문자열이 아니어서 기본값을 사용합니다.")
+        return default
+    value = value.strip()
+    return value or default
 
 
 class NewsArticle(TypedDict, total=False):
@@ -156,10 +174,10 @@ class AppConfig:
             plastic_queries=get_list_config(data, "plastic_queries", DEFAULT_CONFIG["plastic_queries"]),
             competitor_queries=get_list_config(data, "competitor_queries", DEFAULT_CONFIG["competitor_queries"]),
             company_keywords=get_list_config(data, "company_keywords", DEFAULT_CONFIG["company_keywords"]),
-            category_limits=get_dict_config(data, "category_limits", DEFAULT_CONFIG["category_limits"]),
-            category_max_age_days=get_dict_config(data, "category_max_age_days", DEFAULT_CONFIG["category_max_age_days"]),
+            category_limits=get_dict_config(data, "category_limits", DEFAULT_CONFIG["category_limits"], min_value=1),
+            category_max_age_days=get_dict_config(data, "category_max_age_days", DEFAULT_CONFIG["category_max_age_days"], min_value=0),
             stock_exclude_keywords=get_list_config(data, "stock_exclude_keywords", DEFAULT_CONFIG["stock_exclude_keywords"]),
-            claude_model=(os.getenv("CLAUDE_MODEL") or data.get("claude_model") or DEFAULT_CLAUDE_MODEL).strip(),
+            claude_model=get_str_config(data, "claude_model", DEFAULT_CLAUDE_MODEL),
         )
 
 
@@ -214,6 +232,24 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+
+def request_with_retry(method: str, url: str, *, retries: int = 3, backoff: float = 1.0, **kwargs):
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code in {429, 500, 502, 503, 504}:
+                raise requests.HTTPError(f"retryable status: {resp.status_code}", response=resp)
+            return resp
+        except Exception as e:
+            last_error = e
+            if attempt >= retries:
+                raise
+            time.sleep(backoff * attempt)
+    if last_error:
+        raise last_error
+    raise RuntimeError("request_with_retry failed without explicit error")
 
 
 def load_state() -> AppState:
@@ -283,7 +319,7 @@ def validate_config(config: AppConfig) -> None:
 
 def strip_html(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text or "")
-    return text.replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&").strip()
+    return unescape(text).strip()
 
 
 def normalize_text(text: str) -> str:
@@ -316,9 +352,20 @@ def extract_matched_company(text: str, config: AppConfig) -> str:
     return ""
 
 
+def contains_stock_keyword(text: str, keywords: list[str]) -> bool:
+    for keyword in keywords:
+        if re.fullmatch(r"[a-zA-Z0-9]+", keyword):
+            if re.search(rf"\b{re.escape(keyword)}\b", text, re.IGNORECASE):
+                return True
+        else:
+            if keyword.lower() in text:
+                return True
+    return False
+
+
 def is_stock_related_article(article: NewsArticle, config: AppConfig) -> bool:
     combined = normalize_text(f"{article.get('title', '')} {article.get('description', '')}")
-    return any(keyword.lower() in combined for keyword in config.stock_exclude_keywords)
+    return contains_stock_keyword(combined, config.stock_exclude_keywords)
 
 
 COMPETITOR_RELEVANCE_KEYWORDS = [
@@ -335,9 +382,9 @@ def is_valid_competitor_article(article: NewsArticle, config: AppConfig) -> bool
 
 
 def build_fingerprint(article: NewsArticle, config: AppConfig) -> str:
-    title = article.get("title", "")
-    company = extract_matched_company(title, config)
-    tokens = tokenize_title(title)
+    combined = f"{article.get('title', '')} {article.get('description', '')}"
+    company = extract_matched_company(combined, config)
+    tokens = tokenize_title(article.get("title", ""))
     key_tokens = tokens[:6]
     return f"{company}|{' '.join(key_tokens)}".strip("|")
 
@@ -407,7 +454,7 @@ def search_naver_news(query: str, state: AppState, display: int = 5) -> list[New
     }
     params = {"query": query, "display": display, "sort": "date"}
 
-    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_NEWS)
+    resp = request_with_retry("GET", url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_NEWS)
     resp.raise_for_status()
 
     items = resp.json().get("items", [])
@@ -490,8 +537,13 @@ def load_json_list(path: Path) -> list[dict[str, Any]]:
             data = json.load(f)
         if isinstance(data, list):
             return [x for x in data if isinstance(x, dict)]
-    except Exception:
-        pass
+    except Exception as e:
+        safe_print(f"[경고] JSON 이력 파일 로딩 실패: {path.name} / {e}")
+        backup_path = path.with_suffix(path.suffix + ".broken")
+        try:
+            os.replace(path, backup_path)
+        except Exception:
+            pass
     return []
 
 
@@ -738,7 +790,8 @@ def validate_newsletter_text(text: str, competitor_has_news: bool) -> str:
     if "기사 원문" not in cleaned and "http" in cleaned:
         cleaned = re.sub(r"\n(https?://\S+)", r"\n기사 원문\n\1", cleaned)
 
-    if not re.match(r"^\d{4}년 \d{2}월 \d{2}일 \| 오늘의 뉴스 브리핑 📰", cleaned):
+    title_pattern = r"^【?\d{4}년 \d{2}월 \d{2}일 \| 오늘의 뉴스 브리핑 📰】?"
+    if not re.match(title_pattern, cleaned):
         today = now_kst().strftime("%Y년 %m월 %d일")
         cleaned = f"{today} | 오늘의 뉴스 브리핑 📰\n\n" + cleaned
 
@@ -778,7 +831,55 @@ def validate_newsletter_text(text: str, competitor_has_news: bool) -> str:
     if article_source_count != url_count:
         raise ValueError("일부 기사 원문 아래 링크가 누락되었습니다.")
 
-    return cleaned
+    return emphasize_title_line(cleaned)
+
+
+def extract_source_urls(news_data: dict[str, list[NewsArticle]]) -> set[str]:
+    urls: set[str] = set()
+    for articles in news_data.values():
+        for article in articles:
+            link = article.get("link", "").strip()
+            if link:
+                urls.add(link)
+    return urls
+
+
+def extract_source_article_by_url(news_data: dict[str, list[NewsArticle]], url: str) -> NewsArticle | None:
+    for articles in news_data.values():
+        for article in articles:
+            if article.get("link", "").strip() == url:
+                return article
+    return None
+
+
+def source_keyword_tokens(article: NewsArticle) -> set[str]:
+    title_tokens = set(tokenize_title(article.get("title", "")))
+    desc_tokens = set(tokenize_title(article.get("description", "")))
+    return {tok for tok in (title_tokens | desc_tokens) if len(tok) >= 2}
+
+
+def validate_newsletter_against_source(text: str, news_data: dict[str, list[NewsArticle]]) -> str:
+    source_urls = extract_source_urls(news_data)
+    used_urls = re.findall(r"기사 원문\s*\n(https?://\S+)", text)
+
+    for url in used_urls:
+        if url not in source_urls:
+            raise ValueError(f"원본 뉴스에 없는 링크가 포함되었습니다: {url}")
+
+        article = extract_source_article_by_url(news_data, url)
+        if article is None:
+            raise ValueError(f"링크에 대응하는 원본 기사를 찾지 못했습니다: {url}")
+
+        idx = text.find(url)
+        window_start = max(0, idx - 220)
+        window_text = text[window_start:idx]
+        summary_tokens = set(tokenize_title(window_text))
+        source_tokens = source_keyword_tokens(article)
+
+        if source_tokens and not (summary_tokens & source_tokens):
+            raise ValueError(f"요약 문장과 원본 기사 핵심 키워드 연결이 약합니다: {url}")
+
+    return text
 
 
 def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppState) -> str:
@@ -870,7 +971,8 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
 - 마크다운 굵게(**)는 사용하지 말 것
 '''
 
-    response = requests.post(
+    response = request_with_retry(
+        "POST",
         "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key": state.anthropic_api_key,
@@ -896,7 +998,8 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
     if not text:
         raise ValueError(f"Claude 응답 본문이 비어 있습니다: {data}")
 
-    return validate_newsletter_text(text, competitor_has_news=category_counts.get("경쟁사", 0) > 0)
+    validated = validate_newsletter_text(text, competitor_has_news=category_counts.get("경쟁사", 0) > 0)
+    return validate_newsletter_against_source(validated, news_data)
 
 
 def build_no_news_message() -> str:
@@ -945,7 +1048,7 @@ def _send_kakao_message_once(text: str, access_token: str) -> tuple[bool, int, s
     data = {"template_object": json.dumps(template, ensure_ascii=False)}
 
     try:
-        resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+        resp = request_with_retry("POST", url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
         return resp.status_code == 200, resp.status_code, resp.text
     except requests.RequestException as e:
         return False, -1, f"카카오 요청 예외: {e}"
@@ -989,7 +1092,7 @@ def refresh_kakao_token(state: AppState) -> str | None:
     if state.kakao_client_secret:
         data["client_secret"] = state.kakao_client_secret
 
-    resp = requests.post(url, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+    resp = request_with_retry("POST", url, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
     resp.raise_for_status()
 
     result = resp.json()
