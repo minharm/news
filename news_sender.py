@@ -288,10 +288,17 @@ def is_stock_related_article(article: NewsArticle, config: AppConfig) -> bool:
     return any(keyword.lower() in combined for keyword in config.stock_exclude_keywords)
 
 
+COMPETITOR_RELEVANCE_KEYWORDS = [
+    "취출기", "사출", "성형", "injection", "molding",
+    "take out", "takeout", "automation", "robot", "로봇", "자동화"
+]
+
+
 def is_valid_competitor_article(article: NewsArticle, config: AppConfig) -> bool:
-    combined = f"{article.get('title', '')} {article.get('description', '')}"
+    combined = normalize_text(f"{article.get('title', '')} {article.get('description', '')}")
     matched = extract_matched_company(combined, config)
-    return bool(matched) and not is_stock_related_article(article, config)
+    has_relevance = any(k.lower() in combined for k in COMPETITOR_RELEVANCE_KEYWORDS)
+    return bool(matched) and has_relevance and not is_stock_related_article(article, config)
 
 
 def build_fingerprint(article: NewsArticle, config: AppConfig) -> str:
@@ -630,7 +637,9 @@ def evaluate_search_health(state: AppState, health: SearchHealth) -> str | None:
     if health.failures >= MAX_NEWS_SEARCH_FAILURES and failure_ratio >= MAX_NEWS_SEARCH_FAILURE_RATIO:
         return f"뉴스 검색 실패가 기준치를 초과했습니다. ({health.failures}/{total_queries}, {failure_ratio:.0%})"
 
-    if health.category_failures.get("플라스틱_사출", 0) >= len(state.config.plastic_queries):
+    plastic_failures = health.category_failures.get("플라스틱_사출", 0)
+    plastic_total = len(state.config.plastic_queries)
+    if plastic_total > 0 and plastic_failures >= plastic_total:
         return "플라스틱/사출 뉴스 검색 전체 실패"
 
     competitor_failures = health.category_failures.get("경쟁사", 0)
