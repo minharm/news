@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -56,7 +57,7 @@ DEFAULT_CONFIG = {
     "plastic_queries": [
         "플라스틱 산업 동향",
         "사출성형 업계",
-        "플라스틱 원자재 가격",
+        "플라스틱 원자재 가격"
     ],
     "competitor_queries": [
         "유일로보틱스",
@@ -66,22 +67,21 @@ DEFAULT_CONFIG = {
         "한양로보틱스",
         "SEPRO robot",
         "WITTMANN robot",
-        "TOPSTAR robot",
+        "TOPSTAR robot"
     ],
     "company_keywords": DEFAULT_COMPANY_KEYWORDS,
     "category_limits": {
         "플라스틱_사출": 3,
-        "경쟁사": 3,
+        "경쟁사": 3
     },
     "category_max_age_days": {
         "플라스틱_사출": 2,
-        "경쟁사": 1,
+        "경쟁사": 1
     },
     "stock_exclude_keywords": [
-        "주가", "상승", "하락", "급등", "급락", "상한가", "하한가", "매수", "매도",
-        "투자주의", "투자경고", "시총", "시가총액", "증권", "리포트", "목표주가",
-        "per", "pbr", "eps", "코스피", "코스닥", "공모가", "차트", "수급",
-        "기관 순매수", "외국인 순매수", "주식", "종목", "테마주",
+        "주가", "급등", "급락", "상한가", "하한가", "증권", "시가총액", "시총", "공모가",
+        "목표주가", "매수", "매도", "리포트", "투자주의", "투자경고", "테마주", "종목",
+        "코스피", "코스닥", "차트", "수급", "외국인 순매수", "기관 순매수", "per", "pbr", "eps"
     ],
 }
 
@@ -111,7 +111,8 @@ class AppConfig:
         else:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as e:
+                safe_print(f"[경고] config.json 로딩 실패, 기본 설정 사용: {e}")
                 data = DEFAULT_CONFIG
 
         merged = {
@@ -149,6 +150,18 @@ class SearchHealth:
         self.messages.append(f"{query}: {exc}")
 
 
+logger = logging.getLogger("news_bot")
+
+
+def setup_logging() -> None:
+    if logger.handlers:
+        return
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+
+
 def now_kst() -> datetime:
     return datetime.now(KST)
 
@@ -156,14 +169,10 @@ def now_kst() -> datetime:
 def safe_print(*args: object, sep: str = " ", end: str = "\n") -> None:
     text = sep.join("" if a is None else str(a) for a in args) + end
     try:
-        sys.stdout.write(text)
-    except UnicodeEncodeError:
-        encoding = getattr(sys.stdout, "encoding", None) or "cp949"
-        safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
-        sys.stdout.write(safe_text)
+        logger.info(text.rstrip("\n"))
     except Exception:
         try:
-            sys.__stdout__.write(text.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
+            sys.stdout.write(text)
         except Exception:
             pass
 
@@ -638,6 +647,53 @@ def collect_all_news(state: AppState) -> tuple[dict[str, list[NewsArticle]], dic
     return collected, stats, health
 
 
+def validate_newsletter_text(text: str) -> str:
+    cleaned = text.strip()
+
+    if "**" in cleaned:
+        cleaned = cleaned.replace("**", "")
+
+    if "기사 원문" not in cleaned and "http" in cleaned:
+        cleaned = re.sub(r"\n(https?://\S+)", r"\n기사 원문\n\1", cleaned)
+
+    if not re.match(r"^\d{4}년 \d{2}월 \d{2}일 \| 오늘의 뉴스 브리핑 📰", cleaned):
+        today = now_kst().strftime("%Y년 %m월 %d일")
+        cleaned = f"{today} | 오늘의 뉴스 브리핑 📰\n\n" + cleaned
+
+    if not cleaned.endswith(FINAL_SIGNATURE):
+        cleaned = cleaned.rstrip() + f"\n\n{FINAL_SIGNATURE}"
+
+    if "기사 원문" not in cleaned:
+        raise ValueError("Claude 결과에 '기사 원문' 형식이 없습니다.")
+
+    if not re.search(r"기사 원문\nhttps?://\S+", cleaned):
+        raise ValueError("Claude 결과에 '기사 원문' 아래 실제 링크가 없습니다.")
+
+    if FINAL_SIGNATURE not in cleaned:
+        raise ValueError("Claude 결과에 마지막 문구가 없습니다.")
+
+    if len(cleaned) > MAX_NEWSLETTER_LENGTH:
+        sections = cleaned.split("\n\n")
+        rebuilt: list[str] = []
+        for block in sections:
+            candidate = "\n\n".join(rebuilt + [block]).strip()
+            if len(candidate + f"\n\n{FINAL_SIGNATURE}") > MAX_NEWSLETTER_LENGTH:
+                break
+            rebuilt.append(block)
+
+        cleaned = "\n\n".join(rebuilt).strip()
+        if not cleaned.endswith(FINAL_SIGNATURE):
+            if FINAL_SIGNATURE in cleaned:
+                pass
+            else:
+                cleaned = cleaned.rstrip() + f"\n\n{FINAL_SIGNATURE}"
+
+    if len(cleaned) > MAX_NEWSLETTER_LENGTH:
+        raise ValueError(f"Claude 결과가 {MAX_NEWSLETTER_LENGTH}자를 초과합니다.")
+
+    return cleaned
+
+
 def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppState) -> str:
     total_count = sum(len(v) for v in news_data.values())
     if total_count == 0:
@@ -723,7 +779,7 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
 - 유사 기사 묶음이라고 표시된 경우, 묶인 기사의 공통 핵심 이슈로 자연스럽게 요약
 - 원본 뉴스에 없는 사실은 절대 추가하지 말 것
 - 각 카테고리는 수집된 기사만 기준으로 최대 3건 출력
-- 전체 길이는 1,100자 이내
+- 전체 길이는 {MAX_NEWSLETTER_LENGTH}자 이내
 - 마지막 문구는 반드시: "{FINAL_SIGNATURE}"
 - 마크다운 굵게(**)는 사용하지 말 것
 '''
@@ -757,29 +813,6 @@ def summarize_with_claude(news_data: dict[str, list[NewsArticle]], state: AppSta
     return validate_newsletter_text(text)
 
 
-def validate_newsletter_text(text: str) -> str:
-    cleaned = text.strip()
-
-    if "기사 원문" not in cleaned and "http" in cleaned:
-        cleaned = re.sub(r"\n(https?://\S+)", r"\n기사 원문\n\1", cleaned)
-
-    if not cleaned.endswith(FINAL_SIGNATURE):
-        cleaned = cleaned.rstrip() + f"\n\n{FINAL_SIGNATURE}"
-
-    if len(cleaned) > MAX_NEWSLETTER_LENGTH:
-        reserve = len(FINAL_SIGNATURE) + 2
-        cleaned = cleaned[: MAX_NEWSLETTER_LENGTH - reserve].rstrip()
-        cleaned = cleaned + f"\n\n{FINAL_SIGNATURE}"
-
-    if "기사 원문" not in cleaned:
-        raise ValueError("Claude 결과에 '기사 원문' 형식이 없습니다.")
-
-    if FINAL_SIGNATURE not in cleaned:
-        raise ValueError("Claude 결과에 마지막 문구가 없습니다.")
-
-    return cleaned
-
-
 def build_no_news_message() -> str:
     today = now_kst().strftime("%Y년 %m월 %d일")
     return (
@@ -795,7 +828,7 @@ def build_failure_message(reason: str) -> str:
     return (
         f"{today} | 오늘의 뉴스 브리핑 📰\n\n"
         "안녕하세요.\n"
-        "오늘은 뉴스 수집 중 오류가 발생해 브리핑을 생성하지 못했습니다.\n\n"
+        "오늘은 뉴스 수집 또는 발송 과정에서 오류가 발생해 브리핑을 생성하지 못했습니다.\n\n"
         f"오류 요약: {reason}\n\n"
         f"{FINAL_SIGNATURE}"
     )
@@ -821,13 +854,15 @@ def _send_kakao_message_once(text: str, access_token: str) -> tuple[bool, int, s
     }
     data = {"template_object": json.dumps(template, ensure_ascii=False)}
 
-    resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
-    return resp.status_code == 200, resp.status_code, resp.text
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_KAKAO)
+        return resp.status_code == 200, resp.status_code, resp.text
+    except requests.RequestException as e:
+        return False, -1, f"카카오 요청 예외: {e}"
 
 
 def send_kakao_message(text: str, state: AppState) -> bool:
     ok, status, body = _send_kakao_message_once(text, state.kakao_access_token)
-
     if ok:
         safe_print("카카오톡 전송 성공!")
         return True
@@ -911,6 +946,7 @@ def build_today_history_records(news_data: dict[str, list[NewsArticle]], state: 
 
 
 def main() -> None:
+    setup_logging()
     state = load_state()
 
     safe_print("\n" + "=" * 50)
@@ -953,6 +989,12 @@ def main() -> None:
         f"      [경쟁사] raw {c.get('raw', 0)} -> 업체필터 {c.get('company_filtered', 0)} -> "
         f"grouped {c.get('grouped', 0)} -> fresh {c.get('fresh', 0)} -> final {c.get('final', 0)}"
     )
+
+    if health.failures >= MAX_NEWS_SEARCH_FAILURES:
+        reason = f"뉴스 검색 실패가 기준치를 초과했습니다. 실패 {health.failures}건"
+        safe_print(f"[오류] {reason}")
+        send_kakao_message(build_failure_message(reason), state)
+        return
 
     if total == 0:
         if health.failures > 0:
